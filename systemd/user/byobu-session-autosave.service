@@ -1,0 +1,7 @@
+[Unit]
+Description=Autosave current Byobu/tmux session
+Documentation=file:%h/byobu-session-state/README.md
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/byobu-session-state autosave autosave

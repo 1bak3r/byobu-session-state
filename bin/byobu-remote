@@ -1,0 +1,134 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+snapshot_name="${BYOBU_REMOTE_SNAPSHOT:-${BYOBU_SESSION_AUTOSAVE_NAME:-autosave}}"
+remote_session="${BYOBU_REMOTE_SESSION:-}"
+
+usage() {
+  cat >&2 <<'EOF'
+Usage:
+  byobu-remote [attach]
+  byobu-remote status
+  byobu-remote save
+  byobu-remote restore
+
+Attach from another Tailscale computer with a TTY, for example:
+
+  ssh -t -p 2222 bak3r@desktop-gdjcaft ~/.local/bin/byobu-remote
+EOF
+}
+
+fail_usage() {
+  printf '%s\n\n' "$*" >&2
+  usage
+  exit 2
+}
+
+state_cmd() {
+  if command -v byobu-session-state >/dev/null 2>&1; then
+    byobu-session-state "$@"
+  else
+    "$HOME/.local/bin/byobu-session-state" "$@"
+  fi
+}
+
+tailscale_address() {
+  if command -v tailscale >/dev/null 2>&1; then
+    tailscale ip -4 2>/dev/null | sed -n '1p'
+  fi
+}
+
+tmux_cmd() {
+  if command -v byobu-tmux >/dev/null 2>&1; then
+    printf '%s\n' "byobu-tmux"
+  else
+    printf '%s\n' "tmux"
+  fi
+}
+
+session_codex_thread_count() {
+  local session="$1"
+  tmux list-windows -t "$session" -F '#{@byobu-codex-thread-id}' 2>/dev/null \
+    | awk 'NF { count++ } END { print count + 0 }'
+}
+
+best_live_session_name() {
+  command -v tmux >/dev/null 2>&1 || return 1
+
+  local session windows attached activity codex
+  {
+    while IFS=$'\t' read -r session windows attached activity; do
+      [ -n "$session" ] || continue
+      codex=$(session_codex_thread_count "$session")
+      printf '%s\t%s\t%s\t%s\t%s\n' "$windows" "$codex" "$attached" "$activity" "$session"
+    done < <(tmux list-sessions -F '#{session_name}	#{session_windows}	#{session_attached}	#{session_activity}' 2>/dev/null || true)
+  } | sort -t $'\t' -k1,1nr -k2,2nr -k3,3nr -k4,4nr | awk -F '\t' 'NR == 1 { print $5 }'
+}
+
+attach() {
+  state_cmd autorestore --restart-codex "$snapshot_name" >/dev/null || true
+
+  if [ ! -t 0 ] || [ ! -t 1 ]; then
+    local addr
+    addr=$(tailscale_address || true)
+    printf 'A terminal TTY is required to attach to Byobu.\n' >&2
+    printf 'Run this from another Tailscale computer:\n\n' >&2
+    printf '  ssh -t -p 2222 bak3r@desktop-gdjcaft ~/.local/bin/byobu-remote\n' >&2
+    if [ -n "$addr" ]; then
+      printf '  ssh -t -p 2222 bak3r@%s ~/.local/bin/byobu-remote\n' "$addr" >&2
+    fi
+    exit 2
+  fi
+
+  local session tmux_bin
+  tmux_bin=$(tmux_cmd)
+
+  if [ -n "$remote_session" ]; then
+    session="$remote_session"
+  else
+    session=$(best_live_session_name || true)
+  fi
+
+  if [ -n "$session" ]; then
+    exec "$tmux_bin" attach-session -t "$session"
+  fi
+
+  exec "$tmux_bin" new-session -s byobu
+}
+
+status() {
+  local addr
+  addr=$(tailscale_address || true)
+  if [ -n "$addr" ]; then
+    printf 'Tailscale IPv4: %s\n' "$addr"
+  fi
+  state_cmd status
+}
+
+cmd="${1:-attach}"
+case "$cmd" in
+  attach)
+    if [ "$#" -gt 1 ] || { [ "$#" -eq 1 ] && [ "$1" != "attach" ]; }; then
+      fail_usage "attach does not accept arguments"
+    fi
+    attach
+    ;;
+  status)
+    [ "$#" -eq 1 ] || fail_usage "status does not accept arguments"
+    status
+    ;;
+  save)
+    [ "$#" -eq 1 ] || fail_usage "save does not accept arguments"
+    state_cmd autosave "$snapshot_name"
+    ;;
+  restore)
+    [ "$#" -eq 1 ] || fail_usage "restore does not accept arguments"
+    state_cmd autorestore --restart-codex "$snapshot_name"
+    ;;
+  -h|--help|help)
+    usage
+    ;;
+  *)
+    fail_usage "Unknown subcommand: $cmd"
+    ;;
+esac

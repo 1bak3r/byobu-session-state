@@ -1,0 +1,13 @@
+[Unit]
+Description=Watch for exited Byobu/tmux sessions every minute
+Documentation=file:%h/byobu-session-state/README.md
+
+[Timer]
+OnBootSec=45sec
+OnUnitActiveSec=1min
+AccuracySec=10sec
+Persistent=true
+Unit=byobu-session-watchdog.service
+
+[Install]
+WantedBy=timers.target

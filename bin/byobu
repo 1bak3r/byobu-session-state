@@ -1,0 +1,102 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+snapshot_name="${BYOBU_SESSION_AUTOSAVE_NAME:-autosave}"
+
+truthy() {
+  case "${1:-}" in
+    1|true|TRUE|yes|YES|y|Y|on|ON)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+state_cmd() {
+  local script_dir
+  script_dir=$(cd "$(dirname "$0")" && pwd -P)
+
+  if command -v byobu-session-state >/dev/null 2>&1; then
+    byobu-session-state "$@"
+  elif [ -x "$script_dir/byobu-session-state" ]; then
+    "$script_dir/byobu-session-state" "$@"
+  else
+    "$HOME/.local/bin/byobu-session-state" "$@"
+  fi
+}
+
+real_byobu_bin() {
+  if [ -n "${BYOBU_REAL_BIN:-}" ]; then
+    printf '%s\n' "$BYOBU_REAL_BIN"
+    return 0
+  fi
+
+  local candidate
+  for candidate in /usr/bin/byobu /bin/byobu /usr/local/bin/byobu; do
+    if [ -x "$candidate" ]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+byobu_tmux_cmd() {
+  if command -v byobu-tmux >/dev/null 2>&1; then
+    printf '%s\n' "byobu-tmux"
+  else
+    printf '%s\n' "tmux"
+  fi
+}
+
+session_codex_thread_count() {
+  local session="$1"
+  tmux list-windows -t "$session" -F '#{@byobu-codex-thread-id}' 2>/dev/null \
+    | awk 'NF { count++ } END { print count + 0 }'
+}
+
+best_live_session_name() {
+  command -v tmux >/dev/null 2>&1 || return 1
+
+  local session windows attached activity codex
+  {
+    while IFS=$'\t' read -r session windows attached activity; do
+      [ -n "$session" ] || continue
+      codex=$(session_codex_thread_count "$session")
+      printf '%s\t%s\t%s\t%s\t%s\n' "$windows" "$codex" "$attached" "$activity" "$session"
+    done < <(tmux list-sessions -F '#{session_name}	#{session_windows}	#{session_attached}	#{session_activity}' 2>/dev/null || true)
+  } | sort -t $'\t' -k1,1nr -k2,2nr -k3,3nr -k4,4nr | awk -F '\t' 'NR == 1 { print $5 }'
+}
+
+attach_best_session_if_plain_launch() {
+  [ "$#" -eq 0 ] || return 1
+  [ -z "${TMUX:-}" ] || return 1
+  if ! truthy "${BYOBU_SESSION_FORCE_ATTACH:-0}"; then
+    [ -t 0 ] && [ -t 1 ] || return 1
+  fi
+
+  local session tmux_bin
+  session=$(best_live_session_name || true)
+  [ -n "$session" ] || return 1
+
+  tmux_bin=$(byobu_tmux_cmd)
+  exec "$tmux_bin" attach-session -t "$session"
+}
+
+if ! truthy "${BYOBU_SESSION_SKIP_AUTORESTORE:-0}"; then
+  state_cmd autorestore --restart-codex "$snapshot_name" >/dev/null || true
+fi
+
+if attach_best_session_if_plain_launch "$@"; then
+  exit 0
+fi
+
+real_byobu=$(real_byobu_bin) || {
+  printf 'real byobu binary not found. Set BYOBU_REAL_BIN to its path.\n' >&2
+  exit 127
+}
+
+exec "$real_byobu" "$@"

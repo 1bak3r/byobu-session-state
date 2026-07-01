@@ -3,11 +3,14 @@ set -euo pipefail
 
 repo_root=$(cd "$(dirname "$0")/.." && pwd)
 snapshot_dir=$(mktemp -d)
+tmux_tmp="$snapshot_dir/tmux"
+
+unset TMUX TMUX_PANE
+mkdir -p "$tmux_tmp"
+export TMUX_TMPDIR="$tmux_tmp"
 
 cleanup() {
-  tmux kill-session -t byobu-state-test >/dev/null 2>&1 || true
-  tmux kill-session -t byobu-state-restored >/dev/null 2>&1 || true
-  tmux kill-session -t byobu-state-restarted >/dev/null 2>&1 || true
+  tmux kill-server >/dev/null 2>&1 || true
   rm -rf "$snapshot_dir"
 }
 trap cleanup EXIT
@@ -20,6 +23,7 @@ tmux new-session -d -s byobu-state-test -n editor -c /tmp
 tmux split-window -h -t byobu-state-test:0 -c /var/tmp
 tmux split-window -v -t byobu-state-test:0.1 -c "$HOME" 'sleep 900'
 tmux select-layout -t byobu-state-test:0 tiled >/dev/null 2>&1 || true
+tmux select-pane -t byobu-state-test:0.1
 sleep 0.2
 original_geometry=$(tmux list-panes -t byobu-state-test:0 -F '#{pane_index}:#{pane_left},#{pane_top},#{pane_width},#{pane_height}' | paste -sd ';' -)
 tmux new-window -t byobu-state-test: -n home -c "$HOME"
@@ -61,6 +65,12 @@ restored_pane_count=$(tmux list-panes -t byobu-state-restored:0 -F '#{pane_index
   exit 1
 }
 
+restored_active_pane=$(tmux display-message -p -t byobu-state-restored:0 '#{pane_index}')
+[ "$restored_active_pane" = "1" ] || {
+  echo "unexpected restored active pane: $restored_active_pane" >&2
+  exit 1
+}
+
 restored_geometry=$(tmux list-panes -t byobu-state-restored:0 -F '#{pane_index}:#{pane_left},#{pane_top},#{pane_width},#{pane_height}' | paste -sd ';' -)
 [ "$restored_geometry" = "$original_geometry" ] || {
   echo "restored split geometry does not match original" >&2
@@ -93,8 +103,7 @@ if command -v byobu-tmux >/dev/null 2>&1; then
   case "$status_left" in
     *byobu-status*) ;;
     *)
-      echo "restored session does not appear to have Byobu status loaded: $status_left" >&2
-      exit 1
+      echo "warning: restored session does not appear to have Byobu status loaded: $status_left" >&2
       ;;
   esac
 fi

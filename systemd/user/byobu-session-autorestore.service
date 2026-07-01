@@ -1,0 +1,13 @@
+[Unit]
+Description=Restore saved Byobu session when no live tmux session exists
+Documentation=file:%h/byobu-session-state/README.md
+After=default.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/byobu-session-state autorestore --restart-codex autosave
+Environment=BYOBU_SESSION_AUTO_RESTART_PROCESSES=0
+Environment=BYOBU_SESSION_AUTO_RESTART_CODEX=1
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,14 @@
+[Unit]
+Description=Save Byobu/tmux session when user services start and stop
+Documentation=file:%h/byobu-session-state/README.md
+After=default.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=%h/.local/bin/byobu-session-state autosave autosave
+ExecStop=%h/.local/bin/byobu-session-state autosave autosave
+TimeoutStopSec=15
+
+[Install]
+WantedBy=default.target

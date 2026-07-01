@@ -1,0 +1,7 @@
+[Unit]
+Description=Push Byobu tab snapshots and visible git repositories
+Documentation=file:%h/byobu-session-state/README.md
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/byobu-git-sync push

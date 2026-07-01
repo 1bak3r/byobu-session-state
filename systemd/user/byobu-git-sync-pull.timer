@@ -1,0 +1,12 @@
+[Unit]
+Description=Pull Byobu-visible git repositories once a day
+Documentation=file:%h/byobu-session-state/README.md
+
+[Timer]
+OnCalendar=09:00
+AccuracySec=30min
+Persistent=true
+Unit=byobu-git-sync-pull.service
+
+[Install]
+WantedBy=timers.target

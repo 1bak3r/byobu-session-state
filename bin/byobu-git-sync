@@ -1,0 +1,735 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+version="0.1.0"
+state_dir="${BYOBU_GIT_SYNC_STATE_DIR:-$HOME/.local/state/byobu-git-sync}"
+log_file="${BYOBU_GIT_SYNC_LOG:-$state_dir/byobu-git-sync.log}"
+lock_file="$state_dir/byobu-git-sync.lock"
+tmux_target="${BYOBU_GIT_SYNC_TMUX_TARGET:-}"
+commit_prefix="${BYOBU_GIT_SYNC_COMMIT_PREFIX:-byobu autosync}"
+target_repo_dir="${BYOBU_GIT_SYNC_TARGET_DIR:-$state_dir/byobu-tabs-repo}"
+target_remote_name="${BYOBU_GIT_SYNC_TARGET_REMOTE:-origin}"
+target_remote_url="${BYOBU_GIT_SYNC_TARGET_REMOTE_URL:-https://github.com/1bak3r/byobu-tabs.git}"
+target_branch="${BYOBU_GIT_SYNC_TARGET_BRANCH:-main}"
+dry_run=0
+
+usage() {
+  cat >&2 <<'EOF'
+Usage:
+  byobu-git-sync tabs [--dry-run]
+  byobu-git-sync repos [--dry-run]
+  byobu-git-sync status [--dry-run]
+  byobu-git-sync push [--dry-run]
+  byobu-git-sync pull [--dry-run]
+  byobu-git-sync --version
+
+Syncs all live Byobu/tmux tabs into a dedicated git repository, then also scans
+live pane working directories and acts once per unique git repository.
+
+Environment:
+  BYOBU_GIT_SYNC_ALLOW_NON_GITHUB=1  allow remotes outside github.com
+  BYOBU_GIT_SYNC_TMUX_TARGET=name    scan only one tmux session/window target
+  BYOBU_GIT_SYNC_STATE_DIR=path      override logs and lock directory
+  BYOBU_GIT_SYNC_LOG=path            override log file
+  BYOBU_GIT_SYNC_COMMIT_PREFIX=text  override auto-commit message prefix
+  BYOBU_GIT_SYNC_TARGET_DIR=path     override local byobu-tabs checkout
+  BYOBU_GIT_SYNC_TARGET_REMOTE_URL=url
+                                      override byobu-tabs remote
+EOF
+}
+
+fail() {
+  printf '%s\n' "$*" >&2
+  exit 1
+}
+
+fail_usage() {
+  printf '%s\n\n' "$*" >&2
+  usage
+  exit 2
+}
+
+truthy() {
+  case "${1:-}" in
+    1|true|TRUE|yes|YES|y|Y|on|ON)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+ensure_state_dir() {
+  mkdir -p "$state_dir"
+}
+
+log() {
+  local line
+  line="$(date -Is) $*"
+  printf '%s\n' "$line"
+  printf '%s\n' "$line" >> "$log_file"
+}
+
+run_git() {
+  local repo="$1"
+  shift
+  if [ "$dry_run" -eq 1 ]; then
+    log "dry-run: git -C $repo $*"
+    return 0
+  fi
+  git -C "$repo" "$@"
+}
+
+tmux_pane_paths() {
+  command -v tmux >/dev/null 2>&1 || return 0
+
+  if [ -n "$tmux_target" ]; then
+    tmux list-panes -t "$tmux_target" -F '#{pane_current_path}' 2>/dev/null || true
+  else
+    tmux list-panes -a -F '#{pane_current_path}' 2>/dev/null || true
+  fi
+}
+
+tmux_sessions() {
+  command -v tmux >/dev/null 2>&1 || return 0
+  tmux list-sessions -F '#{session_name}' 2>/dev/null || true
+}
+
+tmux_live_panes() {
+  command -v tmux >/dev/null 2>&1 || return 0
+
+  if [ -n "$tmux_target" ]; then
+    tmux list-panes -t "$tmux_target" -F '#{session_name}	#{window_index}	#{window_name}	#{pane_index}	#{pane_current_path}	#{pane_current_command}' 2>/dev/null || true
+  else
+    tmux list-panes -a -F '#{session_name}	#{window_index}	#{window_name}	#{pane_index}	#{pane_current_path}	#{pane_current_command}' 2>/dev/null || true
+  fi
+}
+
+safe_component() {
+  local value="$1"
+  local safe
+  safe=$(printf '%s' "$value" | tr -c 'A-Za-z0-9._-' '_' | sed 's/^_*//; s/_*$//')
+  [ -n "$safe" ] || safe="session"
+  case "$safe" in
+    .*)
+      safe="_$safe"
+      ;;
+  esac
+  printf '%s\n' "$safe"
+}
+
+state_cmd_path() {
+  local script_dir
+  script_dir=$(cd "$(dirname "$0")" && pwd)
+
+  if command -v byobu-session-state >/dev/null 2>&1; then
+    command -v byobu-session-state
+  elif [ -x "$HOME/.local/bin/byobu-session-state" ]; then
+    printf '%s\n' "$HOME/.local/bin/byobu-session-state"
+  elif [ -x "$script_dir/byobu-session-state" ]; then
+    printf '%s\n' "$script_dir/byobu-session-state"
+  else
+    return 1
+  fi
+}
+
+canonical_repo_path() {
+  local path="$1"
+  local repo
+  [ -d "$path" ] || return 0
+  repo=$(git -C "$path" rev-parse --show-toplevel 2>/dev/null || true)
+  [ -n "$repo" ] || return 0
+  (cd "$repo" && pwd -P)
+}
+
+discover_repos() {
+  local -A seen=()
+  local path repo
+
+  while IFS= read -r path; do
+    [ -n "$path" ] || continue
+    repo=$(canonical_repo_path "$path")
+    [ -n "$repo" ] || continue
+    if [ -z "${seen[$repo]:-}" ]; then
+      seen[$repo]=1
+      printf '%s\n' "$repo"
+    fi
+  done < <(tmux_pane_paths)
+}
+
+git_dir_for() {
+  local repo="$1"
+  git -C "$repo" rev-parse --absolute-git-dir 2>/dev/null || true
+}
+
+repo_has_unsafe_state() {
+  local repo="$1"
+  local git_dir
+  git_dir=$(git_dir_for "$repo")
+  [ -n "$git_dir" ] || return 0
+
+  [ ! -f "$git_dir/MERGE_HEAD" ] || return 0
+  [ ! -d "$git_dir/rebase-merge" ] || return 0
+  [ ! -d "$git_dir/rebase-apply" ] || return 0
+  [ ! -f "$git_dir/CHERRY_PICK_HEAD" ] || return 0
+  [ ! -f "$git_dir/REVERT_HEAD" ] || return 0
+  return 1
+}
+
+current_branch() {
+  local repo="$1"
+  git -C "$repo" branch --show-current 2>/dev/null || true
+}
+
+upstream_ref() {
+  local repo="$1"
+  git -C "$repo" rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null || true
+}
+
+remote_for_repo() {
+  local repo="$1"
+  local upstream remote_count
+  upstream=$(upstream_ref "$repo")
+  if [ -n "$upstream" ]; then
+    printf '%s\n' "${upstream%%/*}"
+    return 0
+  fi
+
+  if git -C "$repo" remote get-url --push origin >/dev/null 2>&1; then
+    printf '%s\n' origin
+    return 0
+  fi
+
+  remote_count=$(git -C "$repo" remote | wc -l | tr -d ' ')
+  if [ "$remote_count" = "1" ]; then
+    git -C "$repo" remote | sed -n '1p'
+  fi
+}
+
+remote_push_url() {
+  local repo="$1"
+  local remote="$2"
+  git -C "$repo" remote get-url --push "$remote" 2>/dev/null || true
+}
+
+remote_fetch_ref() {
+  local repo="$1"
+  local remote="$2"
+  local branch="$3"
+  local upstream
+  upstream=$(upstream_ref "$repo")
+  if [ -n "$upstream" ]; then
+    printf '%s\n' "$upstream"
+  else
+    printf '%s/%s\n' "$remote" "$branch"
+  fi
+}
+
+remote_allowed() {
+  local url="$1"
+  if truthy "${BYOBU_GIT_SYNC_ALLOW_NON_GITHUB:-0}"; then
+    return 0
+  fi
+
+  case "$url" in
+    *github.com[:/]*|*github.com)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+repo_has_changes() {
+  local repo="$1"
+  [ -n "$(git -C "$repo" status --porcelain=v1 --untracked-files=all)" ]
+}
+
+git_identity_env() {
+  local repo="$1"
+  local name email host
+  name=$(git -C "$repo" config user.name 2>/dev/null || git config --global user.name 2>/dev/null || true)
+  email=$(git -C "$repo" config user.email 2>/dev/null || git config --global user.email 2>/dev/null || true)
+  host=$(hostname -f 2>/dev/null || hostname 2>/dev/null || printf 'localhost')
+
+  [ -n "$name" ] || name="byobu-git-sync"
+  [ -n "$email" ] || email="byobu-git-sync@$host"
+
+  printf '%s\n%s\n' "$name" "$email"
+}
+
+checkpoint_changes() {
+  local repo="$1"
+  local identity_name identity_email message
+
+  if ! repo_has_changes "$repo"; then
+    return 0
+  fi
+
+  log "checkpointing changes in $repo"
+  if [ "$dry_run" -eq 1 ]; then
+    message="$commit_prefix: $(date '+%Y-%m-%d %H:%M:%S %Z')"
+    log "dry-run: git -C $repo add -A"
+    log "dry-run: git -C $repo commit -m $message"
+    return 0
+  fi
+
+  run_git "$repo" add -A
+  if git -C "$repo" diff --cached --quiet --exit-code; then
+    log "no committable changes after staging $repo"
+    return 0
+  fi
+
+  message="$commit_prefix: $(date '+%Y-%m-%d %H:%M:%S %Z')"
+
+  {
+    IFS= read -r identity_name
+    IFS= read -r identity_email
+  } < <(git_identity_env "$repo")
+
+  GIT_AUTHOR_NAME="$identity_name" \
+    GIT_AUTHOR_EMAIL="$identity_email" \
+    GIT_COMMITTER_NAME="$identity_name" \
+    GIT_COMMITTER_EMAIL="$identity_email" \
+    git -C "$repo" commit -m "$message"
+}
+
+target_has_commits() {
+  git -C "$target_repo_dir" rev-parse --verify HEAD >/dev/null 2>&1
+}
+
+ensure_target_repo() {
+  ensure_state_dir
+  mkdir -p "$target_repo_dir"
+
+  if ! git -C "$target_repo_dir" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    if ! git -C "$target_repo_dir" init -b "$target_branch" >/dev/null 2>&1; then
+      git -C "$target_repo_dir" init >/dev/null
+      git -C "$target_repo_dir" checkout -B "$target_branch" >/dev/null
+    fi
+  fi
+
+  git -C "$target_repo_dir" checkout -B "$target_branch" >/dev/null 2>&1 || true
+
+  if [ -n "$target_remote_url" ]; then
+    if git -C "$target_repo_dir" remote get-url "$target_remote_name" >/dev/null 2>&1; then
+      git -C "$target_repo_dir" remote set-url "$target_remote_name" "$target_remote_url"
+    else
+      git -C "$target_repo_dir" remote add "$target_remote_name" "$target_remote_url"
+    fi
+  fi
+
+  if ! git -C "$target_repo_dir" config user.name >/dev/null 2>&1; then
+    git -C "$target_repo_dir" config user.name "byobu-git-sync"
+  fi
+  if ! git -C "$target_repo_dir" config user.email >/dev/null 2>&1; then
+    git -C "$target_repo_dir" config user.email "byobu-git-sync@$(hostname 2>/dev/null || printf localhost)"
+  fi
+}
+
+target_remote_ref_exists() {
+  git -C "$target_repo_dir" rev-parse --verify --quiet "$target_remote_name/$target_branch" >/dev/null
+}
+
+sync_tabs_pull() {
+  local counts ahead behind
+  ensure_target_repo
+
+  if [ -z "$target_remote_url" ]; then
+    log "byobu tabs target has no remote URL; pull skipped"
+    return 0
+  fi
+
+  log "fetching byobu tabs target from $target_remote_url"
+  if ! run_git "$target_repo_dir" fetch --prune "$target_remote_name"; then
+    log "fetch failed for byobu tabs target"
+    return 1
+  fi
+
+  if ! target_remote_ref_exists; then
+    log "byobu tabs target remote branch $target_remote_name/$target_branch does not exist yet"
+    return 0
+  fi
+
+  if ! target_has_commits; then
+    log "checking out byobu tabs target from $target_remote_name/$target_branch"
+    run_git "$target_repo_dir" checkout -B "$target_branch" "$target_remote_name/$target_branch"
+    return $?
+  fi
+
+  counts=$(git -C "$target_repo_dir" rev-list --left-right --count "HEAD...$target_remote_name/$target_branch" 2>/dev/null || true)
+  if [ -z "$counts" ]; then
+    log "skip byobu tabs target pull: unable to compare with $target_remote_name/$target_branch"
+    return 0
+  fi
+  ahead=${counts%%[[:space:]]*}
+  behind=${counts##*[[:space:]]}
+
+  if [ "$behind" = "0" ]; then
+    log "byobu tabs target is up to date"
+    return 0
+  fi
+
+  if [ "$ahead" != "0" ]; then
+    log "skip byobu tabs target pull: local branch is $ahead ahead and $behind behind $target_remote_name/$target_branch"
+    return 1
+  fi
+
+  log "fast-forwarding byobu tabs target from $target_remote_name/$target_branch"
+  run_git "$target_repo_dir" merge --ff-only "$target_remote_name/$target_branch"
+}
+
+write_tabs_snapshot() {
+  local captured_at state_cmd session snapshot_name
+
+  if [ "$dry_run" -eq 1 ]; then
+    log "dry-run: would write live byobu tabs into $target_repo_dir"
+    return 0
+  fi
+
+  captured_at=$(date -Is)
+  rm -rf "$target_repo_dir/tabs" "$target_repo_dir/snapshots" "$target_repo_dir/metadata"
+  mkdir -p "$target_repo_dir/tabs" "$target_repo_dir/snapshots" "$target_repo_dir/metadata"
+
+  cat > "$target_repo_dir/README.md" <<EOF
+# Byobu Tabs
+
+Automatic Byobu/tmux tab snapshots from $(hostname 2>/dev/null || printf localhost).
+
+Last captured: $captured_at
+
+This repository is maintained by \`byobu-git-sync\`. It stores pane metadata and
+restorable \`byobu-session-state\` snapshots. It does not store scrollback or the
+contents of pane working directories.
+EOF
+
+  {
+    printf 'captured_at\tsession\twindow_index\twindow_name\tpane_index\tpane_current_path\tpane_current_command\n'
+    while IFS= read -r line; do
+      printf '%s\t%s\n' "$captured_at" "$line"
+    done < <(tmux_live_panes)
+  } > "$target_repo_dir/tabs/live.tsv"
+
+  {
+    printf '# Live Byobu Tabs\n\n'
+    printf 'Captured: %s\n\n' "$captured_at"
+    printf '| Session | Window | Window name | Pane | Path | Command |\n'
+    printf '| --- | ---: | --- | ---: | --- | --- |\n'
+    while IFS=$'\t' read -r session window_index window_name pane_index pane_path pane_command; do
+      printf '| `%s` | %s | `%s` | %s | `%s` | `%s` |\n' \
+        "$session" "$window_index" "$window_name" "$pane_index" "$pane_path" "$pane_command"
+    done < <(tmux_live_panes)
+  } > "$target_repo_dir/tabs/live.md"
+
+  printf 'snapshot\tsession\n' > "$target_repo_dir/metadata/session-map.tsv"
+  state_cmd=$(state_cmd_path || true)
+  if [ -z "$state_cmd" ]; then
+    log "byobu-session-state command not found; session snapshots skipped"
+    return 0
+  fi
+
+  while IFS= read -r session; do
+    [ -n "$session" ] || continue
+    snapshot_name=$(safe_component "$session")
+    printf '%s.snapshot\t%s\n' "$snapshot_name" "$session" >> "$target_repo_dir/metadata/session-map.tsv"
+    BYOBU_SESSION_STATE_DIR="$target_repo_dir/snapshots" "$state_cmd" save "$snapshot_name" "$session" >> "$log_file" 2>&1 || {
+      log "failed to write byobu-session-state snapshot for session $session"
+      return 1
+    }
+  done < <(tmux_sessions)
+}
+
+commit_tabs_snapshot() {
+  local identity_name identity_email message
+
+  run_git "$target_repo_dir" add -A
+  if [ "$dry_run" -eq 1 ]; then
+    log "dry-run: would commit byobu tabs snapshot in $target_repo_dir"
+    return 0
+  fi
+
+  if git -C "$target_repo_dir" diff --cached --quiet --exit-code; then
+    log "no byobu tabs target changes to commit"
+    return 0
+  fi
+
+  message="byobu tabs autosync: $(date '+%Y-%m-%d %H:%M:%S %Z')"
+  {
+    IFS= read -r identity_name
+    IFS= read -r identity_email
+  } < <(git_identity_env "$target_repo_dir")
+
+  GIT_AUTHOR_NAME="$identity_name" \
+    GIT_AUTHOR_EMAIL="$identity_email" \
+    GIT_COMMITTER_NAME="$identity_name" \
+    GIT_COMMITTER_EMAIL="$identity_email" \
+    git -C "$target_repo_dir" commit -m "$message"
+}
+
+sync_tabs_push() {
+  local failed=0
+  ensure_target_repo
+  sync_tabs_pull || failed=1
+  write_tabs_snapshot || failed=1
+  commit_tabs_snapshot || failed=1
+
+  if [ -z "$target_remote_url" ]; then
+    log "byobu tabs target has no remote URL; push skipped"
+    return "$failed"
+  fi
+
+  log "pushing byobu tabs target to $target_remote_url"
+  run_git "$target_repo_dir" push -u "$target_remote_name" "HEAD:$target_branch" || failed=1
+  return "$failed"
+}
+
+sync_tabs_status() {
+  ensure_target_repo
+  printf 'byobu-tabs-target\tpath=%s\tremote=%s\tbranch=%s\n' "$target_repo_dir" "${target_remote_url:-none}" "$target_branch"
+  status_repo "$target_repo_dir"
+}
+
+push_repo() {
+  local repo="$1"
+  local branch remote url upstream push_args=()
+
+  branch=$(current_branch "$repo")
+  if [ -z "$branch" ]; then
+    log "skip $repo: detached HEAD"
+    return 0
+  fi
+
+  if repo_has_unsafe_state "$repo"; then
+    log "skip $repo: merge/rebase/cherry-pick in progress"
+    return 0
+  fi
+
+  remote=$(remote_for_repo "$repo")
+  if [ -z "$remote" ]; then
+    log "skip $repo: no git remote"
+    return 0
+  fi
+
+  url=$(remote_push_url "$repo" "$remote")
+  if [ -z "$url" ]; then
+    log "skip $repo: no push URL for remote $remote"
+    return 0
+  fi
+
+  if ! remote_allowed "$url"; then
+    log "skip $repo: remote $remote is not github.com ($url)"
+    return 0
+  fi
+
+  checkpoint_changes "$repo"
+
+  upstream=$(upstream_ref "$repo")
+  if [ -n "$upstream" ]; then
+    push_args=("$remote" "HEAD")
+  else
+    push_args=("-u" "$remote" "HEAD")
+  fi
+
+  log "pushing $repo to $remote/$branch"
+  if run_git "$repo" push "${push_args[@]}"; then
+    log "pushed $repo"
+  else
+    log "push failed for $repo"
+    return 1
+  fi
+}
+
+pull_repo() {
+  local repo="$1"
+  local branch remote url remote_ref counts ahead behind
+
+  branch=$(current_branch "$repo")
+  if [ -z "$branch" ]; then
+    log "skip $repo: detached HEAD"
+    return 0
+  fi
+
+  if repo_has_unsafe_state "$repo"; then
+    log "skip $repo: merge/rebase/cherry-pick in progress"
+    return 0
+  fi
+
+  remote=$(remote_for_repo "$repo")
+  if [ -z "$remote" ]; then
+    log "skip $repo: no git remote"
+    return 0
+  fi
+
+  url=$(remote_push_url "$repo" "$remote")
+  if [ -z "$url" ]; then
+    log "skip $repo: no URL for remote $remote"
+    return 0
+  fi
+
+  if ! remote_allowed "$url"; then
+    log "skip $repo: remote $remote is not github.com ($url)"
+    return 0
+  fi
+
+  checkpoint_changes "$repo"
+
+  log "fetching $repo from $remote"
+  run_git "$repo" fetch --prune "$remote"
+
+  remote_ref=$(remote_fetch_ref "$repo" "$remote" "$branch")
+  if ! git -C "$repo" rev-parse --verify --quiet "$remote_ref" >/dev/null; then
+    log "skip $repo: remote branch $remote_ref does not exist"
+    return 0
+  fi
+
+  counts=$(git -C "$repo" rev-list --left-right --count "HEAD...$remote_ref" 2>/dev/null || true)
+  if [ -z "$counts" ]; then
+    log "skip $repo: unable to compare HEAD with $remote_ref"
+    return 0
+  fi
+  ahead=${counts%%[[:space:]]*}
+  behind=${counts##*[[:space:]]}
+
+  if [ "$behind" = "0" ]; then
+    log "up to date $repo"
+    return 0
+  fi
+
+  if [ "$ahead" != "0" ]; then
+    log "skip $repo: local branch is $ahead ahead and $behind behind $remote_ref; manual rebase/merge needed"
+    return 0
+  fi
+
+  log "fast-forwarding $repo from $remote_ref"
+  if run_git "$repo" merge --ff-only "$remote_ref"; then
+    log "pulled $repo"
+  else
+    log "pull failed for $repo"
+    return 1
+  fi
+}
+
+status_repo() {
+  local repo="$1"
+  local branch upstream changes
+  branch=$(current_branch "$repo")
+  upstream=$(upstream_ref "$repo")
+  if repo_has_changes "$repo"; then
+    changes=dirty
+  else
+    changes=clean
+  fi
+  printf '%s\tbranch=%s\tupstream=%s\t%s\n' "$repo" "${branch:-detached}" "${upstream:-none}" "$changes"
+}
+
+with_lock() {
+  ensure_state_dir
+  exec 9>"$lock_file"
+  if ! flock -n 9; then
+    log "another byobu-git-sync run is already active"
+    return 0
+  fi
+  "$@"
+}
+
+run_for_repos() {
+  local action="$1"
+  local repo found=0 failed=0
+
+  while IFS= read -r repo; do
+    [ -n "$repo" ] || continue
+    found=1
+    if ! "$action" "$repo"; then
+      failed=1
+    fi
+  done < <(discover_repos)
+
+  if [ "$found" -eq 0 ]; then
+    log "no git repositories found in live byobu/tmux pane paths"
+  fi
+
+  return "$failed"
+}
+
+push_all() {
+  local failed=0
+  sync_tabs_push || failed=1
+  run_for_repos push_repo || failed=1
+  return "$failed"
+}
+
+pull_all() {
+  local failed=0
+  sync_tabs_pull || failed=1
+  run_for_repos pull_repo || failed=1
+  return "$failed"
+}
+
+status_all() {
+  sync_tabs_status
+  run_for_repos status_repo
+}
+
+parse_args() {
+  [ "$#" -ge 1 ] || fail_usage "missing subcommand"
+  cmd="$1"
+  shift
+
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --dry-run)
+        dry_run=1
+        shift
+        ;;
+      --)
+        shift
+        [ "$#" -eq 0 ] || fail_usage "unexpected arguments: $*"
+        ;;
+      --*)
+        fail_usage "unknown option: $1"
+        ;;
+      *)
+        fail_usage "unexpected argument: $1"
+        ;;
+    esac
+  done
+}
+
+cmd="${1:-}"
+case "$cmd" in
+  -h|--help|help)
+    usage
+    exit 0
+    ;;
+  --version)
+    printf 'byobu-git-sync %s\n' "$version"
+    exit 0
+    ;;
+esac
+
+parse_args "$@"
+
+case "$cmd" in
+  tabs)
+    with_lock sync_tabs_push
+    ;;
+  repos)
+    ensure_state_dir
+    discover_repos
+    ;;
+  status)
+    ensure_state_dir
+    status_all
+    ;;
+  push)
+    with_lock push_all
+    ;;
+  pull)
+    with_lock pull_all
+    ;;
+  *)
+    fail_usage "unknown subcommand: $cmd"
+    ;;
+esac

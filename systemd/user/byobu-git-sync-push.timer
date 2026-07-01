@@ -1,0 +1,13 @@
+[Unit]
+Description=Push Byobu-visible git repositories every 30 minutes
+Documentation=file:%h/byobu-session-state/README.md
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=30min
+AccuracySec=1min
+Persistent=true
+Unit=byobu-git-sync-push.service
+
+[Install]
+WantedBy=timers.target

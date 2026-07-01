@@ -1,0 +1,7 @@
+[Unit]
+Description=Pull Byobu tab snapshot repo and visible git repositories
+Documentation=file:%h/byobu-session-state/README.md
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/byobu-git-sync pull

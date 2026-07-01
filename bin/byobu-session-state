@@ -1,35 +1,72 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-version="0.2.0"
+version="0.6.0"
 snapshot_root="${BYOBU_SESSION_STATE_DIR:-$HOME/.local/state/byobu-session-state}"
+declare -A restore_codex_started_threads=()
+declare -A restore_codex_preferred_threads=()
+restore_codex_preferred_session=""
+restore_codex_resumed_threads=""
+restore_codex_suppressed_threads=""
 
 usage() {
   cat >&2 <<'EOF'
 Usage:
   byobu-session-state save [snapshot_name] [session_name]
-  byobu-session-state restore [--restart-processes] <snapshot_name> [target_session]
+  byobu-session-state autosave [snapshot_name] [session_name]
+  byobu-session-state autorestore [--dry-run] [--restart-codex|--no-restart-codex] [--restart-processes] [snapshot_name] [target_session]
+  byobu-session-state watchdog [--restart-codex|--no-restart-codex] [--restart-processes] [--no-restore] [snapshot_name]
+  byobu-session-state restore [--dry-run] [--restart-codex|--no-restart-codex] [--restart-processes] <snapshot_name> [target_session]
+  byobu-session-state doctor [snapshot_name]
+  byobu-session-state prune [--dry-run|--delete] [snapshot_name]
   byobu-session-state list
+  byobu-session-state status
+  byobu-session-state incidents [snapshot_name]
   byobu-session-state --version
 
 Examples:
   byobu-session-state save
   byobu-session-state save work
   byobu-session-state save work mysession
+  byobu-session-state autosave
   byobu-session-state restore work
+  byobu-session-state autorestore
+  byobu-session-state restore --no-restart-codex work
+  byobu-session-state restore --dry-run work
   byobu-session-state restore --restart-processes work
+  byobu-session-state watchdog
   byobu-session-state restore work restored-work
+  byobu-session-state doctor
+  byobu-session-state prune
+  byobu-session-state prune --delete
   byobu-session-state list
+  byobu-session-state status
+  byobu-session-state incidents
 
 Notes:
   - Captures tmux/byobu windows, pane cwd values, pane counts, layouts, and
     the active window/pane.
   - Captures foreground pane command lines when detectable.
-  - Does not restore running commands by default. Use --restart-processes to
-    send captured command lines into restored panes.
+  - Captures Byobu Codex tab metadata created by byobu-codex and resumes those
+    tabs by default with `codex resume SESSION_ID`.
+  - Multi-session autosave restore starts each Codex thread at most once by
+    default. Duplicate tabs keep their metadata but remain shells.
+  - Does not restore arbitrary running commands by default. Use
+    --restart-processes to send captured command lines into restored panes.
   - Does not restore scrollback.
   - Restore uses byobu-tmux when available so Byobu keybindings/status are
     initialized instead of creating a plain tmux session.
+  - autosave chooses the attached or most recently active tmux/byobu session
+    when no session name is passed. It exits successfully when no tmux server
+    is running so it is safe for timers.
+  - autosave refuses to replace an existing snapshot with a lower-quality
+    snapshot that has fewer windows or Codex thread ids, unless
+    BYOBU_SESSION_ALLOW_DEGRADED_AUTOSAVE=1 is set.
+  - autorestore restores the autosave snapshot only when there are no live
+    tmux sessions, so it is safe to run at shell login or user-systemd startup.
+  - watchdog records a live-session heartbeat. If a later run sees that all
+    tmux sessions disappeared, it checks capacity-related signals such as OOM
+    logs and low memory/disk before restoring the autosave snapshot.
   - Set BYOBU_SESSION_STATE_DIR to override the snapshot directory.
 EOF
 }
@@ -70,6 +107,11 @@ validate_session_name() {
 }
 
 byobu_tmux_cmd() {
+  if [ -n "${TMUX_TMPDIR:-}" ]; then
+    printf '%s\n' "tmux"
+    return 0
+  fi
+
   if command -v byobu-tmux >/dev/null 2>&1; then
     printf '%s\n' "byobu-tmux"
   else
@@ -78,9 +120,13 @@ byobu_tmux_cmd() {
 }
 
 source_byobu_profile() {
+  [ -z "${TMUX_TMPDIR:-}" ] || return 0
   command -v byobu-tmux >/dev/null 2>&1 || return 0
-  [ -r /usr/share/byobu/profiles/tmuxrc ] || return 0
-  byobu-tmux source-file /usr/share/byobu/profiles/tmuxrc >/dev/null 2>&1 || true
+  local profile
+  for profile in /usr/share/byobu/profiles/tmux /usr/share/byobu/profiles/tmuxrc; do
+    [ -r "$profile" ] || continue
+    byobu-tmux source-file "$profile" >/dev/null 2>&1 || true
+  done
 }
 
 current_session_name() {
@@ -97,6 +143,43 @@ resolve_session_name() {
   current_session_name
 }
 
+latest_session_name() {
+  tmux list-sessions -F '#{session_attached} #{session_activity} #{session_id} #{session_name}' 2>/dev/null \
+    | awk '{ gsub(/[^0-9]/, "", $3); print }' \
+    | sort -k1,1nr -k2,2nr -k3,3nr \
+    | sed -n '1s/^[^ ]* [^ ]* [^ ]* //p'
+}
+
+tmux_has_sessions() {
+  tmux list-sessions >/dev/null 2>&1
+}
+
+live_autosave_session_names() {
+  tmux list-sessions -F '#{session_group}	#{session_name}	#{session_attached}	#{session_activity}	#{session_id}' 2>/dev/null \
+    | awk -F '\t' '
+      {
+        key = $1
+        if (key == "") key = "session:" $2
+        id = $5
+        gsub(/[^0-9]/, "", id)
+        rank = sprintf("%010d%020d%020d", $3 + 0, $4 + 0, id + 0)
+        if (!(key in best_rank) || rank > best_rank[key]) {
+          best_rank[key] = rank
+          best_name[key] = $2
+        }
+      }
+      END {
+        for (key in best_name) printf "%s\t%s\n", best_rank[key], best_name[key]
+      }
+    ' \
+    | sort -r \
+    | cut -f2-
+}
+
+best_live_autosave_session_name() {
+  live_autosave_session_names | sed -n '1p'
+}
+
 ensure_snapshot_root() {
   mkdir -p "$snapshot_root"
 }
@@ -104,6 +187,136 @@ ensure_snapshot_root() {
 snapshot_path_for() {
   local snapshot_name="$1"
   printf '%s/%s.snapshot\n' "$snapshot_root" "$snapshot_name"
+}
+
+last_good_snapshot_path_for() {
+  local snapshot_name="$1"
+  printf '%s/%s.last-good.snapshot\n' "$snapshot_root" "$snapshot_name"
+}
+
+snapshot_history_dir() {
+  printf '%s/history\n' "$snapshot_root"
+}
+
+autosave_sessions_manifest_path_for() {
+  local snapshot_name="$1"
+  printf '%s/%s.sessions.tsv\n' "$snapshot_root" "$snapshot_name"
+}
+
+watchdog_state_path_for() {
+  local snapshot_name="$1"
+  printf '%s/%s.watchdog.state\n' "$snapshot_root" "$snapshot_name"
+}
+
+watchdog_sessions_path_for() {
+  local snapshot_name="$1"
+  printf '%s/%s.watchdog.sessions.tsv\n' "$snapshot_root" "$snapshot_name"
+}
+
+watchdog_log_path_for() {
+  local snapshot_name="$1"
+  printf '%s/%s.watchdog.log\n' "$snapshot_root" "$snapshot_name"
+}
+
+watchdog_incident_path_for() {
+  local snapshot_name="$1"
+  printf '%s/%s.watchdog.incident.tsv\n' "$snapshot_root" "$snapshot_name"
+}
+
+state_lock_path() {
+  printf '%s/.state.lock\n' "$snapshot_root"
+}
+
+release_state_lock() {
+  local lock_path="${BYOBU_SESSION_LOCK_HELD:-}"
+  [ -n "$lock_path" ] || return 0
+  [ -d "$lock_path" ] || return 0
+
+  local owner
+  owner=$(sed -n '1p' "$lock_path/pid" 2>/dev/null || true)
+  [ "$owner" = "$$" ] || return 0
+
+  rm -f "$lock_path/pid" "$lock_path/boot_id" 2>/dev/null || true
+  rmdir "$lock_path" 2>/dev/null || true
+}
+
+requires_state_lock() {
+  case "${1:-}" in
+    save|autosave|auto-save|autorestore|auto-restore|watchdog|watch|restore|prune)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+acquire_state_lock() {
+  truthy "${BYOBU_SESSION_DISABLE_LOCK:-0}" && return 0
+  [ -z "${BYOBU_SESSION_LOCK_HELD:-}" ] || return 0
+  ensure_snapshot_root
+
+  local timeout lock_path deadline owner
+  timeout="${BYOBU_SESSION_LOCK_TIMEOUT_SECONDS:-${BYOBU_SESSION_LOCK_TIMEOUT:-60}}"
+  case "$timeout" in
+    ''|*[!0-9]*)
+      timeout=60
+      ;;
+  esac
+
+  lock_path=$(state_lock_path)
+  deadline=$(( $(date +%s) + timeout ))
+
+  while ! mkdir "$lock_path" 2>/dev/null; do
+    owner=$(sed -n '1p' "$lock_path/pid" 2>/dev/null || true)
+    if [ -n "$owner" ] && ! kill -0 "$owner" 2>/dev/null; then
+      rm -f "$lock_path/pid" "$lock_path/boot_id" 2>/dev/null || true
+      rmdir "$lock_path" 2>/dev/null || true
+      continue
+    fi
+
+    if [ "$(date +%s)" -ge "$deadline" ]; then
+      fail "timed out waiting for byobu-session-state lock at $lock_path"
+    fi
+    sleep 0.1
+  done
+
+  printf '%s\n' "$$" > "$lock_path/pid"
+  boot_id > "$lock_path/boot_id" 2>/dev/null || true
+  BYOBU_SESSION_LOCK_HELD="$lock_path"
+  trap release_state_lock EXIT
+}
+
+safe_snapshot_component() {
+  local value="$1"
+  local safe
+  safe=$(printf '%s' "$value" | tr -c 'A-Za-z0-9._-' '_' | sed 's/^_*//; s/_*$//')
+  [ -n "$safe" ] || safe="session"
+  case "$safe" in
+    .*)
+      safe="_$safe"
+      ;;
+  esac
+  printf '%s\n' "$safe"
+}
+
+session_autosave_snapshot_name() {
+  local snapshot_name="$1"
+  local session_name="$2"
+  printf '%s.session.%s\n' "$snapshot_name" "$(safe_snapshot_component "$session_name")"
+}
+
+default_autosave_snapshot_name() {
+  printf '%s\n' "${BYOBU_SESSION_AUTOSAVE_NAME:-autosave}"
+}
+
+now_iso() {
+  date '+%Y-%m-%dT%H:%M:%S%z'
+}
+
+epoch_to_journal_time() {
+  local epoch="$1"
+  date -d "@$epoch" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || printf '@%s\n' "$epoch"
 }
 
 truthy() {
@@ -115,6 +328,183 @@ truthy() {
       return 1
       ;;
   esac
+}
+
+is_uuid_like() {
+  case "${1:-}" in
+    ????????-????-????-????-????????????)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+shell_join() {
+  local out="" arg quoted
+  for arg in "$@"; do
+    if [ -z "$out" ]; then
+      printf -v out '%q' "$arg"
+    else
+      printf -v quoted '%q' "$arg"
+      out="$out $quoted"
+    fi
+  done
+  printf '%s\n' "$out"
+}
+
+byobu_codex_cmd() {
+  local script_dir
+  script_dir=$(cd "$(dirname "$0")" && pwd)
+
+  if [ -x "$script_dir/byobu-codex" ]; then
+    printf '%s\n' "$script_dir/byobu-codex"
+  elif command -v byobu-codex >/dev/null 2>&1; then
+    command -v byobu-codex
+  elif [ -x "$HOME/.local/bin/byobu-codex" ]; then
+    printf '%s\n' "$HOME/.local/bin/byobu-codex"
+  else
+    return 1
+  fi
+}
+
+adopt_codex_tabs() {
+  local session_name="$1"
+  local cmd
+
+  truthy "${BYOBU_SESSION_SKIP_CODEX_ADOPT:-0}" && return 0
+  cmd=$(byobu_codex_cmd || true)
+  [ -n "$cmd" ] || return 0
+
+  BYOBU_CODEX_ADOPT_NO_AUTOSAVE=1 "$cmd" adopt --quiet --no-autosave --session "$session_name" >/dev/null 2>&1 || true
+}
+
+snapshot_window_count() {
+  local snapshot_path="$1"
+  awk -F= '$1 == "window_count" { gsub(/[^0-9]/, "", $2); print $2; found=1; exit } END { if (!found) print 0 }' "$snapshot_path" 2>/dev/null
+}
+
+snapshot_codex_count() {
+  local snapshot_path="$1"
+  grep -c '^window_codex_thread_ids\[[0-9][0-9]*\]=' "$snapshot_path" 2>/dev/null || true
+}
+
+snapshot_named_window_count() {
+  local snapshot_path="$1"
+  awk -F= '
+    /^window_names\[[0-9]+\]=/ {
+      value=$2
+      if (value != "-" && value != "" && value != "\\-") count++
+    }
+    END { print count + 0 }
+  ' "$snapshot_path" 2>/dev/null
+}
+
+snapshot_score() {
+  local snapshot_path="$1"
+  local windows codex named
+  windows=$(snapshot_window_count "$snapshot_path")
+  codex=$(snapshot_codex_count "$snapshot_path")
+  named=$(snapshot_named_window_count "$snapshot_path")
+  printf '%s\n' $((windows * 1000 + codex * 100 + named))
+}
+
+snapshot_quality_summary() {
+  local snapshot_path="$1"
+  printf 'windows=%s codex=%s named=%s score=%s\n' \
+    "$(snapshot_window_count "$snapshot_path")" \
+    "$(snapshot_codex_count "$snapshot_path")" \
+    "$(snapshot_named_window_count "$snapshot_path")" \
+    "$(snapshot_score "$snapshot_path")"
+}
+
+snapshot_degrades() {
+  local new_snapshot="$1"
+  local old_snapshot="$2"
+  [ -f "$new_snapshot" ] || return 1
+  [ -f "$old_snapshot" ] || return 1
+
+  local new_windows old_windows new_codex old_codex
+  new_windows=$(snapshot_window_count "$new_snapshot")
+  old_windows=$(snapshot_window_count "$old_snapshot")
+  new_codex=$(snapshot_codex_count "$new_snapshot")
+  old_codex=$(snapshot_codex_count "$old_snapshot")
+
+  [ "$old_windows" -gt "$new_windows" ] && return 0
+  [ "$old_codex" -gt "$new_codex" ] && return 0
+  return 1
+}
+
+backup_existing_snapshot() {
+  local snapshot_name="$1"
+  local snapshot_path="$2"
+  [ -f "$snapshot_path" ] || return 0
+
+  local history_dir timestamp backup_path
+  history_dir=$(snapshot_history_dir)
+  mkdir -p "$history_dir"
+  timestamp=$(date '+%Y%m%d-%H%M%S')
+  backup_path="$history_dir/${snapshot_name}-${timestamp}.snapshot"
+  install -m 0600 "$snapshot_path" "$backup_path"
+  install -m 0600 "$snapshot_path" "$snapshot_root/${snapshot_name}.previous.snapshot"
+}
+
+install_snapshot_file() {
+  local snapshot_name="$1"
+  local tmp_snapshot="$2"
+  local snapshot_path="$3"
+  local mode="${4:-save}"
+
+  if [ "$mode" = "autosave" ] && [ -f "$snapshot_path" ] && ! truthy "${BYOBU_SESSION_ALLOW_DEGRADED_AUTOSAVE:-0}"; then
+    if snapshot_degrades "$tmp_snapshot" "$snapshot_path"; then
+      local rejected_dir rejected_path timestamp
+      rejected_dir="$snapshot_root/rejected"
+      mkdir -p "$rejected_dir"
+      timestamp=$(date '+%Y%m%d-%H%M%S')
+      rejected_path="$rejected_dir/${snapshot_name}-${timestamp}.snapshot"
+      install -m 0600 "$tmp_snapshot" "$rejected_path"
+      printf 'Skipped degraded autosave for %s: existing %s; rejected %s at %s\n' \
+        "$snapshot_name" "$(snapshot_quality_summary "$snapshot_path")" \
+        "$(snapshot_quality_summary "$tmp_snapshot")" "$rejected_path"
+      return 2
+    fi
+  fi
+
+  backup_existing_snapshot "$snapshot_name" "$snapshot_path"
+  install -m 0600 "$tmp_snapshot" "$snapshot_path"
+
+  if [ "$mode" = "autosave" ]; then
+    install -m 0600 "$snapshot_path" "$(last_good_snapshot_path_for "$snapshot_name")"
+  fi
+
+  return 0
+}
+
+restore_snapshot_path_for() {
+  local snapshot_name="$1"
+  local current last_good
+  current=$(snapshot_path_for "$snapshot_name")
+  last_good=$(last_good_snapshot_path_for "$snapshot_name")
+
+  if [ -f "$last_good" ] && [ -f "$current" ]; then
+    if [ "$(snapshot_score "$last_good")" -gt "$(snapshot_score "$current")" ]; then
+      printf '%s\n' "$last_good"
+      return 0
+    fi
+  fi
+
+  if [ -f "$current" ]; then
+    printf '%s\n' "$current"
+    return 0
+  fi
+
+  if [ -f "$last_good" ]; then
+    printf '%s\n' "$last_good"
+    return 0
+  fi
+
+  printf '%s\n' "$current"
 }
 
 validate_snapshot_file_trust() {
@@ -132,31 +522,288 @@ validate_snapshot_file_trust() {
   fi
 }
 
+manifest_references_snapshot() {
+  local manifest="$1"
+  local wanted_snapshot="$2"
+  [ -f "$manifest" ] || return 1
+  awk -F '\t' -v wanted="$wanted_snapshot" '$1 == "snapshot" && $3 == wanted { found=1 } END { exit found ? 0 : 1 }' "$manifest"
+}
+
+autosave_session_snapshot_bases() {
+  local snapshot_name="$1"
+  local path file base
+  [ -d "$snapshot_root" ] || return 0
+
+  for path in "$snapshot_root"/"$snapshot_name".session.*.snapshot; do
+    [ -e "$path" ] || continue
+    file=$(basename "$path")
+    case "$file" in
+      *.last-good.snapshot)
+        base="${file%.last-good.snapshot}"
+        ;;
+      *.previous.snapshot)
+        base="${file%.previous.snapshot}"
+        ;;
+      *.snapshot)
+        base="${file%.snapshot}"
+        ;;
+      *)
+        continue
+        ;;
+    esac
+    printf '%s\n' "$base"
+  done | sort -u
+}
+
+unreferenced_autosave_session_snapshot_bases() {
+  local snapshot_name="$1"
+  local manifest base
+  manifest=$(autosave_sessions_manifest_path_for "$snapshot_name")
+
+  while IFS= read -r base; do
+    [ -n "$base" ] || continue
+    if ! manifest_references_snapshot "$manifest" "$base"; then
+      printf '%s\n' "$base"
+    fi
+  done < <(autosave_session_snapshot_bases "$snapshot_name")
+}
+
+autosave_session_snapshot_paths_for_base() {
+  local base="$1"
+  printf '%s/%s.snapshot\n' "$snapshot_root" "$base"
+  printf '%s/%s.last-good.snapshot\n' "$snapshot_root" "$base"
+  printf '%s/%s.previous.snapshot\n' "$snapshot_root" "$base"
+}
+
+print_autosave_restore_plan() {
+  local snapshot_name="$1"
+  local manifest primary_session kind session per_snapshot extra path status found=0
+  manifest=$(autosave_sessions_manifest_path_for "$snapshot_name")
+
+  printf 'Autosave restore plan for %s:\n' "$snapshot_name"
+  if [ -f "$manifest" ]; then
+    printf '  manifest: %s\n' "$manifest"
+    primary_session=$(awk -F '\t' '$1 == "primary" { print $2; exit }' "$manifest")
+    if [ -n "$primary_session" ]; then
+      printf '  primary: %s\n' "$primary_session"
+    else
+      printf '  primary: unknown\n'
+    fi
+
+    while IFS=$'\t' read -r kind session per_snapshot extra; do
+      case "$kind" in
+        ''|\#*|primary)
+          continue
+          ;;
+        snapshot)
+          found=1
+          path=$(restore_snapshot_path_for "$per_snapshot")
+          if [ -f "$path" ]; then
+            status="present $(snapshot_quality_summary "$path")"
+          else
+            status="missing"
+          fi
+          if [ "$session" = "$primary_session" ]; then
+            printf '  session: %s snapshot=%s primary=yes status=%s path=%s\n' "$session" "$per_snapshot" "$status" "$path"
+          else
+            printf '  session: %s snapshot=%s primary=no status=%s path=%s\n' "$session" "$per_snapshot" "$status" "$path"
+          fi
+          ;;
+      esac
+    done < "$manifest"
+
+    if [ "$found" -eq 0 ]; then
+      printf '  sessions: none\n'
+    fi
+    return 0
+  fi
+
+  printf '  manifest: missing (%s)\n' "$manifest"
+  path=$(restore_snapshot_path_for "$snapshot_name")
+  if [ -f "$path" ]; then
+    printf '  fallback: snapshot=%s status=present %s path=%s\n' "$snapshot_name" "$(snapshot_quality_summary "$path")" "$path"
+  else
+    printf '  fallback: snapshot=%s status=missing path=%s\n' "$snapshot_name" "$path"
+  fi
+}
+
+print_unreferenced_autosave_session_snapshots() {
+  local snapshot_name="$1"
+  local base path found=0
+
+  printf 'Unreferenced autosave session snapshots for %s:\n' "$snapshot_name"
+  while IFS= read -r base; do
+    [ -n "$base" ] || continue
+    found=1
+    printf '  %s\n' "$base"
+    while IFS= read -r path; do
+      [ -e "$path" ] || continue
+      printf '    %s\n' "$path"
+    done < <(autosave_session_snapshot_paths_for_base "$base")
+  done < <(unreferenced_autosave_session_snapshot_bases "$snapshot_name")
+
+  if [ "$found" -eq 0 ]; then
+    printf '  none\n'
+  fi
+}
+
+print_lock_status() {
+  local lock_path owner alive
+  lock_path=$(state_lock_path)
+  if [ ! -d "$lock_path" ]; then
+    printf 'Lock: clear path=%s\n' "$lock_path"
+    return 0
+  fi
+
+  owner=$(sed -n '1p' "$lock_path/pid" 2>/dev/null || true)
+  alive="unknown"
+  if [ -z "$owner" ]; then
+    alive="no-pid"
+  elif kill -0 "$owner" 2>/dev/null; then
+    alive="yes"
+  else
+    alive="no"
+  fi
+  printf 'Lock: held path=%s pid=%s alive=%s\n' "$lock_path" "${owner:-unknown}" "$alive"
+}
+
+print_command_summary() {
+  local cmd path
+  printf 'Commands:\n'
+  for cmd in tmux byobu byobu-tmux byobu-session-state byobu-codex byobu-remote byobu-git-sync; do
+    path=$(command -v "$cmd" 2>/dev/null || true)
+    if [ -n "$path" ]; then
+      printf '  %s: %s\n' "$cmd" "$path"
+    else
+      printf '  %s: missing\n' "$cmd"
+    fi
+  done
+}
+
+print_systemd_summary() {
+  command -v systemctl >/dev/null 2>&1 || {
+    printf 'Systemd user units: systemctl missing\n'
+    return 0
+  }
+
+  local unit enabled active
+  printf 'Systemd user units:\n'
+  for unit in \
+    byobu-session-autosave.timer \
+    byobu-session-watchdog.timer \
+    byobu-session-autorestore.service \
+    byobu-session-shutdown-save.service \
+    byobu-git-sync-push.timer \
+    byobu-git-sync-pull.timer; do
+    enabled=$(systemctl --user is-enabled "$unit" 2>/dev/null || true)
+    active=$(systemctl --user is-active "$unit" 2>/dev/null || true)
+    printf '  %s enabled=%s active=%s\n' "$unit" "${enabled:-unknown}" "${active:-unknown}"
+  done
+}
+
+print_watchdog_summary() {
+  local snapshot_name="$1"
+  local state_path log_path incident_path last_seen session_count last_log
+  state_path=$(watchdog_state_path_for "$snapshot_name")
+  log_path=$(watchdog_log_path_for "$snapshot_name")
+  incident_path=$(watchdog_incident_path_for "$snapshot_name")
+
+  printf 'Watchdog for %s:\n' "$snapshot_name"
+  if [ -f "$state_path" ]; then
+    last_seen=$(watchdog_state_value "$state_path" last_seen_iso)
+    session_count=$(watchdog_state_value "$state_path" session_count)
+    printf '  state: %s last_seen=%s session_count=%s\n' "$state_path" "${last_seen:-unknown}" "${session_count:-unknown}"
+  else
+    printf '  state: missing (%s)\n' "$state_path"
+  fi
+
+  if [ -f "$incident_path" ]; then
+    printf '  incident: %s\n' "$incident_path"
+  else
+    printf '  incident: none\n'
+  fi
+
+  if [ -f "$log_path" ]; then
+    last_log=$(tail -n 1 "$log_path" 2>/dev/null || true)
+    printf '  log: %s\n' "$log_path"
+    printf '  last_log: %s\n' "${last_log:-empty}"
+  else
+    printf '  log: missing (%s)\n' "$log_path"
+  fi
+}
+
+print_live_sessions_summary() {
+  printf 'Live tmux/byobu sessions:\n'
+  command -v tmux >/dev/null 2>&1 || {
+    printf '  tmux missing\n'
+    return 0
+  }
+  if ! tmux_has_sessions; then
+    printf '  none\n'
+    return 0
+  fi
+  tmux list-sessions -F '  #{session_name} windows=#{session_windows} attached=#{session_attached} activity=#{session_activity}'
+}
+
+is_shell_name() {
+  case "$1" in
+    bash|dash|fish|ksh|mksh|sh|zsh|-bash|-dash|-fish|-ksh|-mksh|-sh|-zsh)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+shell_invocation_has_command() {
+  local args="$1"
+  case " ${args} " in
+    *\ -c\ *|*\ -lc\ *|*\ -cl\ *)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+foreground_child_pid() {
+  local parent_pid="$1"
+  ps --ppid "$parent_pid" -o pid=,stat= 2>/dev/null \
+    | awk '
+      $2 ~ /\+/ { print $1; found=1; exit }
+      NF && first == "" { first=$1 }
+      END { if (!found && first != "") print first }
+    '
+}
+
 pane_restart_command() {
   local pane_target="$1"
-  local pane_pid pane_command command_pid child_pid command_name
+  local pane_pid command_pid child_pid command_name command_args
   pane_pid=$(tmux display-message -p -t "$pane_target" '#{pane_pid}' 2>/dev/null || true)
   [ -n "$pane_pid" ] || return 0
 
   command_pid="$pane_pid"
-  while child_pid=$(ps --ppid "$command_pid" -o pid= 2>/dev/null | awk 'NF {pid=$1} END {print pid}'); [ -n "$child_pid" ]; do
+  while true; do
+    command_name=$(ps -o comm= -p "$command_pid" 2>/dev/null | sed -n '1p')
+    command_args=$(ps -o args= -p "$command_pid" 2>/dev/null | sed -n '1p')
+    [ -n "$command_name" ] || return 0
+
+    if ! is_shell_name "$command_name"; then
+      printf '%s\n' "$command_args"
+      return 0
+    fi
+
+    if shell_invocation_has_command "$command_args"; then
+      printf '%s\n' "$command_args"
+      return 0
+    fi
+
+    child_pid=$(foreground_child_pid "$command_pid")
+    [ -n "$child_pid" ] || return 0
     command_pid="$child_pid"
   done
-
-  command_name=$(ps -o comm= -p "$command_pid" 2>/dev/null | sed -n '1p')
-  case "$command_name" in
-    bash|dash|fish|ksh|mksh|sh|zsh|-bash|-dash|-fish|-ksh|-mksh|-sh|-zsh)
-      pane_command=$(tmux display-message -p -t "$pane_target" '#{pane_current_command}' 2>/dev/null || true)
-      case "$pane_command" in
-        bash|dash|fish|ksh|mksh|sh|zsh|-bash|-dash|-fish|-ksh|-mksh|-sh|-zsh|'')
-          return 0
-          ;;
-      esac
-      ;;
-  esac
-
-  ps -o args= -p "$command_pid" 2>/dev/null | sed -n '1p' || true
-  return 0
 }
 
 safe_path() {
@@ -164,7 +811,243 @@ safe_path() {
   if [ -d "$path" ]; then
     printf '%s\n' "$path"
   else
-    printf '%s\n' "$HOME"
+  printf '%s\n' "$HOME"
+  fi
+}
+
+watchdog_state_value() {
+  local state_path="$1"
+  local key="$2"
+  [ -f "$state_path" ] || return 0
+  awk -F= -v key="$key" '$1 == key { sub(/^[^=]*=/, ""); print; exit }' "$state_path"
+}
+
+watchdog_log() {
+  local snapshot_name="$1"
+  shift
+  ensure_snapshot_root
+
+  local line log_path
+  log_path=$(watchdog_log_path_for "$snapshot_name")
+  line="$(now_iso) $*"
+  printf '%s\n' "$line" >> "$log_path"
+  printf '%s\n' "$line"
+}
+
+watchdog_log_block() {
+  local snapshot_name="$1"
+  local text="$2"
+  [ -n "$text" ] || return 0
+  ensure_snapshot_root
+
+  local log_path
+  log_path=$(watchdog_log_path_for "$snapshot_name")
+  printf '%s\n' "$text" >> "$log_path"
+  printf '%s\n' "$text"
+}
+
+write_watchdog_incident() {
+  local snapshot_name="$1"
+  local action="$2"
+  local capacity_found="$3"
+  local reason="$4"
+  local last_seen_epoch="${5:-}"
+  local last_seen_iso="${6:-}"
+  local last_session_count="${7:-}"
+  local restore_summary="${8:-}"
+  ensure_snapshot_root
+
+  local incident_path tmp
+  incident_path=$(watchdog_incident_path_for "$snapshot_name")
+  tmp=$(mktemp)
+  trap 'rm -f "${tmp:-}"' RETURN
+
+  {
+    printf 'incident_at\t%s\n' "$(now_iso)"
+    printf 'snapshot\t%s\n' "$snapshot_name"
+    printf 'action\t%s\n' "$action"
+    printf 'capacity_found\t%s\n' "$capacity_found"
+    printf 'reason\t%s\n' "$reason"
+    printf 'last_seen_epoch\t%s\n' "$last_seen_epoch"
+    printf 'last_seen_iso\t%s\n' "$last_seen_iso"
+    printf 'last_session_count\t%s\n' "$last_session_count"
+    printf 'restored_summary\t%s\n' "$restore_summary"
+    printf 'resumed_codex_threads\t%s\n' "$restore_codex_resumed_threads"
+    printf 'suppressed_duplicate_codex_threads\t%s\n' "$restore_codex_suppressed_threads"
+    printf 'watchdog_log\t%s\n' "$(watchdog_log_path_for "$snapshot_name")"
+  } > "$tmp"
+
+  install -m 0600 "$tmp" "$incident_path"
+  rm -f "$tmp"
+  trap - RETURN
+}
+
+boot_id() {
+  sed -n '1p' /proc/sys/kernel/random/boot_id 2>/dev/null || true
+}
+
+write_watchdog_heartbeat() {
+  local snapshot_name="$1"
+  ensure_snapshot_root
+
+  local state_path sessions_path tmp_state tmp_sessions now_epoch now_time current_boot session_count
+  state_path=$(watchdog_state_path_for "$snapshot_name")
+  sessions_path=$(watchdog_sessions_path_for "$snapshot_name")
+  tmp_state=$(mktemp)
+  tmp_sessions=$(mktemp)
+  now_epoch=$(date +%s)
+  now_time=$(now_iso)
+  current_boot=$(boot_id)
+
+  tmux list-sessions -F '#{session_name}	#{session_group}	#{session_grouped}	#{session_windows}	#{session_attached}	#{session_created}	#{session_activity}' > "$tmp_sessions"
+  session_count=$(awk 'NF { count++ } END { print count + 0 }' "$tmp_sessions")
+
+  {
+    printf 'snapshot_name=%s\n' "$snapshot_name"
+    printf 'last_seen_epoch=%s\n' "$now_epoch"
+    printf 'last_seen_iso=%s\n' "$now_time"
+    printf 'boot_id=%s\n' "$current_boot"
+    printf 'session_count=%s\n' "$session_count"
+  } > "$tmp_state"
+
+  install -m 0600 "$tmp_state" "$state_path"
+  install -m 0600 "$tmp_sessions" "$sessions_path"
+  rm -f "$tmp_state" "$tmp_sessions"
+}
+
+journal_capacity_lines_since() {
+  local since_epoch="$1"
+  command -v journalctl >/dev/null 2>&1 || return 1
+
+  local since_time
+  since_time=$(epoch_to_journal_time "$since_epoch")
+  journalctl -k --since "$since_time" --no-pager 2>/dev/null \
+    | awk '
+      BEGIN { IGNORECASE = 1 }
+      /out of memory|oom-killer|invoked oom-killer|killed process|memory cgroup out of memory|oom_reaper/ {
+        print
+        found = 1
+        count++
+        if (count >= 8) exit
+      }
+      END { exit found ? 0 : 1 }
+    '
+}
+
+journal_context_lines_since() {
+  local since_epoch="$1"
+  command -v journalctl >/dev/null 2>&1 || return 1
+
+  local since_time
+  since_time=$(epoch_to_journal_time "$since_epoch")
+  {
+    journalctl -k --since "$since_time" --no-pager 2>/dev/null || true
+    journalctl --user --since "$since_time" --no-pager 2>/dev/null || true
+    journalctl --since "$since_time" --no-pager 2>/dev/null || true
+  } | awk '
+      BEGIN { IGNORECASE = 1 }
+      /tmux|byobu|segfault|core dumped|killed process|out of memory|oom-killer|memory cgroup|signal|crash|shutdown|reboot|terminated|exited/ {
+        print
+        found = 1
+        count++
+        if (count >= 24) exit
+      }
+      END { exit found ? 0 : 1 }
+    '
+}
+
+current_memory_pressure_reason() {
+  local threshold available
+  threshold="${BYOBU_SESSION_CAPACITY_MIN_MEM_MB:-512}"
+  case "$threshold" in
+    ''|*[!0-9]*)
+      threshold=512
+      ;;
+  esac
+
+  available=$(awk '/^MemAvailable:/ { print int($2 / 1024); found=1; exit } END { if (!found) print "" }' /proc/meminfo 2>/dev/null || true)
+  [ -n "$available" ] || return 1
+  if [ "$available" -lt "$threshold" ]; then
+    printf 'current MemAvailable is %s MB, below BYOBU_SESSION_CAPACITY_MIN_MEM_MB=%s\n' "$available" "$threshold"
+    return 0
+  fi
+  return 1
+}
+
+current_disk_pressure_reason() {
+  local threshold available
+  threshold="${BYOBU_SESSION_CAPACITY_MIN_DISK_MB:-256}"
+  case "$threshold" in
+    ''|*[!0-9]*)
+      threshold=256
+      ;;
+  esac
+
+  available=$(df -Pm "$snapshot_root" 2>/dev/null | awk 'NR == 2 { print $4; found=1; exit } END { if (!found) print "" }')
+  [ -n "$available" ] || return 1
+  if [ "$available" -lt "$threshold" ]; then
+    printf 'available disk for %s is %s MB, below BYOBU_SESSION_CAPACITY_MIN_DISK_MB=%s\n' "$snapshot_root" "$available" "$threshold"
+    return 0
+  fi
+  return 1
+}
+
+watchdog_capacity_report_since() {
+  local since_epoch="$1"
+  local capacity=0
+  local since_time lines reason
+  since_time=$(epoch_to_journal_time "$since_epoch")
+
+  if [ -n "${BYOBU_SESSION_WATCHDOG_FORCE_CAPACITY_REASON:-}" ]; then
+    printf 'capacity evidence: %s\n' "$BYOBU_SESSION_WATCHDOG_FORCE_CAPACITY_REASON"
+    capacity=1
+  fi
+
+  if lines=$(journal_capacity_lines_since "$since_epoch"); then
+    printf 'capacity evidence: kernel log matched OOM patterns since %s\n%s\n' "$since_time" "$lines"
+    capacity=1
+  fi
+
+  if reason=$(current_memory_pressure_reason); then
+    printf 'capacity pressure: %s\n' "$reason"
+    capacity=1
+  fi
+
+  if reason=$(current_disk_pressure_reason); then
+    printf 'capacity pressure: %s\n' "$reason"
+    capacity=1
+  fi
+
+  [ "$capacity" -eq 1 ]
+}
+
+watchdog_diagnostic_report_since() {
+  local snapshot_name="$1"
+  local since_epoch="$2"
+  local last_boot="${3:-}"
+  local current_boot="${4:-}"
+  local since_time sessions_path lines
+  since_time=$(epoch_to_journal_time "$since_epoch")
+  sessions_path=$(watchdog_sessions_path_for "$snapshot_name")
+
+  if [ -n "$last_boot" ] && [ -n "$current_boot" ] && [ "$last_boot" != "$current_boot" ]; then
+    printf 'diagnostic: boot id changed from %s to %s after the last Byobu heartbeat.\n' "$last_boot" "$current_boot"
+  fi
+
+  if [ -f "$sessions_path" ]; then
+    printf 'diagnostic: last live tmux sessions before disappearance:\n'
+    awk -F '\t' '
+      NF {
+        printf "  session=%s group=%s grouped=%s windows=%s attached=%s created=%s activity=%s\n",
+          $1, $2, $3, $4, $5, $6, $7
+      }
+    ' "$sessions_path"
+  fi
+
+  if lines=$(journal_context_lines_since "$since_epoch"); then
+    printf 'diagnostic: relevant journal lines since %s:\n%s\n' "$since_time" "$lines"
+  else
+    printf 'diagnostic: no direct tmux/byobu crash, exit, OOM, shutdown, or signal journal lines found since %s.\n' "$since_time"
   fi
 }
 
@@ -187,6 +1070,8 @@ cmd_save() {
     fail "tmux session not found: $session_name"
   fi
 
+  adopt_codex_tabs "$session_name"
+
   if [ -z "$snapshot_name" ]; then
     snapshot_name="$session_name"
     validate_snapshot_name "$snapshot_name"
@@ -196,13 +1081,15 @@ cmd_save() {
   snapshot_path=$(snapshot_path_for "$snapshot_name")
   local tmp
   tmp=$(mktemp)
-  trap 'rm -f "${tmp:-}"' EXIT
+  trap 'rm -f "${tmp:-}"' RETURN
 
   local active_window_index
   active_window_index=$(tmux display-message -p -t "$session_name" '#I')
 
   printf 'session_name=%q\n' "$session_name" > "$tmp"
   printf 'active_window_position=%q\n' "0" >> "$tmp"
+  printf 'declare -a window_codex_thread_ids=()\n' >> "$tmp"
+  printf 'declare -a window_codex_cwds=()\n' >> "$tmp"
 
   local -a window_indexes=()
   while IFS= read -r idx; do
@@ -218,7 +1105,7 @@ cmd_save() {
     local window_name window_layout active_pane_index
     window_name=$(tmux display-message -p -t "$target" '#{window_name}')
     window_layout=$(tmux display-message -p -t "$target" '#{window_layout}')
-    active_pane_index=$(tmux display-message -p -t "$target" '#{window_active}')
+    active_pane_index=$(tmux display-message -p -t "$target" '#{pane_index}')
 
     printf 'window_indexes[%d]=%q\n' "$array_index" "$window_index" >> "$tmp"
     printf 'window_names[%d]=%q\n' "$array_index" "$window_name" >> "$tmp"
@@ -239,34 +1126,426 @@ cmd_save() {
 
     local pane_array_index=0
     local pane_index
+    local first_pane_path=""
     for pane_index in "${pane_indexes[@]}"; do
       local pane_path restart_command pane_target
       pane_target="${target}.${pane_index}"
       pane_path=$(tmux display-message -p -t "${target}.${pane_index}" '#{pane_current_path}')
+      if [ "$pane_array_index" -eq 0 ]; then
+        first_pane_path="$pane_path"
+      fi
       restart_command=$(pane_restart_command "$pane_target")
       printf 'window_%d_pane_paths[%d]=%q\n' "$array_index" "$pane_array_index" "$pane_path" >> "$tmp"
       printf 'window_%d_pane_restart_commands[%d]=%q\n' "$array_index" "$pane_array_index" "$restart_command" >> "$tmp"
       pane_array_index=$((pane_array_index + 1))
     done
 
+    local codex_thread_id codex_cwd
+    codex_thread_id=$(tmux show-options -wqv -t "$target" '@byobu-codex-thread-id' 2>/dev/null || true)
+    codex_cwd=$(tmux show-options -wqv -t "$target" '@byobu-codex-cwd' 2>/dev/null || true)
+    [ -n "$codex_cwd" ] || codex_cwd="$first_pane_path"
+    if is_uuid_like "$codex_thread_id"; then
+      printf 'window_codex_thread_ids[%d]=%q\n' "$array_index" "$codex_thread_id" >> "$tmp"
+      printf 'window_codex_cwds[%d]=%q\n' "$array_index" "$codex_cwd" >> "$tmp"
+    fi
+
     array_index=$((array_index + 1))
   done
 
-  install -m 0600 "$tmp" "$snapshot_path"
+  local save_mode="${BYOBU_SESSION_SAVE_MODE:-save}"
+  local install_status=0
+  install_snapshot_file "$snapshot_name" "$tmp" "$snapshot_path" "$save_mode" || install_status=$?
   rm -f "$tmp"
-  trap - EXIT
+  trap - RETURN
+
+  if [ "$install_status" -eq 2 ]; then
+    return 0
+  fi
+  [ "$install_status" -eq 0 ] || return "$install_status"
 
   printf 'Saved snapshot %s for tmux session %s at %s\n' "$snapshot_name" "$session_name" "$snapshot_path"
+}
+
+write_autosave_sessions_manifest() {
+  local snapshot_name="$1"
+  local primary_session="$2"
+  shift 2
+
+  local manifest tmp session per_snapshot
+  manifest=$(autosave_sessions_manifest_path_for "$snapshot_name")
+  tmp=$(mktemp)
+  trap 'rm -f "${tmp:-}"' RETURN
+
+  printf '# byobu-session-state autosave sessions v1\n' > "$tmp"
+  printf 'primary\t%s\n' "$primary_session" >> "$tmp"
+  for session in "$@"; do
+    [ -n "$session" ] || continue
+    per_snapshot=$(session_autosave_snapshot_name "$snapshot_name" "$session")
+    printf 'snapshot\t%s\t%s\n' "$session" "$per_snapshot" >> "$tmp"
+  done
+
+  install -m 0600 "$tmp" "$manifest"
+  rm -f "$tmp"
+  trap - RETURN
+}
+
+best_autosave_primary_session() {
+  local snapshot_name="$1"
+  local fallback_session="$2"
+  shift 2
+
+  local best_session="" best_score=-1 best_is_fallback=-1
+  local session per_snapshot path score is_fallback
+  for session in "$@"; do
+    [ -n "$session" ] || continue
+    per_snapshot=$(session_autosave_snapshot_name "$snapshot_name" "$session")
+    path=$(restore_snapshot_path_for "$per_snapshot")
+    [ -f "$path" ] || continue
+    score=$(snapshot_score "$path")
+    is_fallback=0
+    [ "$session" = "$fallback_session" ] && is_fallback=1
+
+    if [ "$score" -gt "$best_score" ] || { [ "$score" -eq "$best_score" ] && [ "$is_fallback" -gt "$best_is_fallback" ]; }; then
+      best_session="$session"
+      best_score="$score"
+      best_is_fallback="$is_fallback"
+    fi
+  done
+
+  if [ -n "$best_session" ]; then
+    printf '%s\n' "$best_session"
+  else
+    printf '%s\n' "$fallback_session"
+  fi
+}
+
+cmd_autosave() {
+  ensure_tmux
+  ensure_snapshot_root
+
+  [ "$#" -le 2 ] || fail_usage "autosave accepts at most 2 arguments"
+
+  local snapshot_name="${1:-}"
+  if [ -z "$snapshot_name" ]; then
+    snapshot_name=$(default_autosave_snapshot_name)
+  fi
+  validate_snapshot_name "$snapshot_name"
+
+  local session_name="${2:-}"
+  local explicit_session=0
+  if [ -n "$session_name" ]; then
+    explicit_session=1
+  fi
+
+  local -a live_sessions=()
+  if [ "$explicit_session" -eq 0 ] && truthy "${BYOBU_SESSION_AUTOSAVE_ALL:-1}"; then
+    local live_session
+    while IFS= read -r live_session; do
+      [ -n "$live_session" ] && live_sessions+=("$live_session")
+    done < <(live_autosave_session_names)
+  fi
+
+  if [ -z "$session_name" ]; then
+    if [ "${#live_sessions[@]}" -gt 0 ]; then
+      session_name="${live_sessions[0]}"
+    else
+      session_name=$(best_live_autosave_session_name || true)
+    fi
+  fi
+  if [ -z "$session_name" ]; then
+    session_name=$(latest_session_name || true)
+  fi
+
+  if [ -z "$session_name" ]; then
+    printf 'No tmux/byobu sessions to autosave.\n'
+    return 0
+  fi
+
+  if [ "$explicit_session" -eq 0 ]; then
+    local selected_session=""
+    local candidate
+    for candidate in "$session_name" "${live_sessions[@]}"; do
+      [ -n "$candidate" ] || continue
+      if tmux has-session -t "$candidate" 2>/dev/null; then
+        selected_session="$candidate"
+        break
+      fi
+      printf 'Skipped vanished tmux/byobu session during autosave: %s\n' "$candidate"
+    done
+    session_name="$selected_session"
+    if [ -z "$session_name" ]; then
+      printf 'No tmux/byobu sessions to autosave.\n'
+      return 0
+    fi
+  fi
+
+  validate_session_name "$session_name"
+  BYOBU_SESSION_SAVE_MODE=autosave cmd_save "$snapshot_name" "$session_name"
+
+  if [ "$explicit_session" -eq 0 ] && truthy "${BYOBU_SESSION_AUTOSAVE_ALL:-1}"; then
+    local session per_snapshot
+    local -a saved_sessions=()
+
+    for session in "${live_sessions[@]}"; do
+      validate_session_name "$session"
+      if ! tmux has-session -t "$session" 2>/dev/null; then
+        printf 'Skipped vanished tmux/byobu session during autosave: %s\n' "$session"
+        continue
+      fi
+      per_snapshot=$(session_autosave_snapshot_name "$snapshot_name" "$session")
+      validate_snapshot_name "$per_snapshot"
+      BYOBU_SESSION_SAVE_MODE=autosave cmd_save "$per_snapshot" "$session"
+      saved_sessions+=("$session")
+    done
+
+    [ "${#saved_sessions[@]}" -gt 0 ] || return 0
+
+    local primary_session
+    primary_session=$(best_autosave_primary_session "$snapshot_name" "$session_name" "${saved_sessions[@]}")
+    write_autosave_sessions_manifest "$snapshot_name" "$primary_session" "${saved_sessions[@]}"
+  fi
+}
+
+cmd_watchdog() {
+  ensure_tmux
+  ensure_snapshot_root
+
+  local restart_processes=0
+  local restart_codex=1
+  local restore_enabled=1
+  if truthy "${BYOBU_SESSION_RESTART_PROCESSES:-0}" || truthy "${BYOBU_SESSION_AUTO_RESTART_PROCESSES:-0}"; then
+    restart_processes=1
+  fi
+  if ! truthy "${BYOBU_SESSION_RESTART_CODEX:-1}" || ! truthy "${BYOBU_SESSION_AUTO_RESTART_CODEX:-1}"; then
+    restart_codex=0
+  fi
+  if ! truthy "${BYOBU_SESSION_WATCHDOG_RESTORE:-1}"; then
+    restore_enabled=0
+  fi
+
+  local -a args=()
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --restart-processes)
+        restart_processes=1
+        shift
+        ;;
+      --no-restart-processes)
+        restart_processes=0
+        shift
+        ;;
+      --restart-codex)
+        restart_codex=1
+        shift
+        ;;
+      --no-restart-codex)
+        restart_codex=0
+        shift
+        ;;
+      --restore)
+        restore_enabled=1
+        shift
+        ;;
+      --no-restore)
+        restore_enabled=0
+        shift
+        ;;
+      --)
+        shift
+        while [ "$#" -gt 0 ]; do
+          args+=("$1")
+          shift
+        done
+        ;;
+      --*)
+        fail_usage "unknown watchdog option: $1"
+        ;;
+      *)
+        args+=("$1")
+        shift
+        ;;
+    esac
+  done
+  set -- "${args[@]}"
+
+  [ "$#" -le 1 ] || fail_usage "watchdog accepts at most 1 argument"
+
+  local snapshot_name="${1:-}"
+  if [ -z "$snapshot_name" ]; then
+    snapshot_name=$(default_autosave_snapshot_name)
+  fi
+  validate_snapshot_name "$snapshot_name"
+
+  if tmux_has_sessions; then
+    write_watchdog_heartbeat "$snapshot_name"
+    watchdog_log "$snapshot_name" "tmux sessions are live; heartbeat recorded."
+    return 0
+  fi
+
+  local state_path last_seen_epoch last_seen_iso last_session_count last_boot current_boot snapshot_path
+  state_path=$(watchdog_state_path_for "$snapshot_name")
+  last_seen_epoch=$(watchdog_state_value "$state_path" last_seen_epoch)
+  last_seen_iso=$(watchdog_state_value "$state_path" last_seen_iso)
+  last_session_count=$(watchdog_state_value "$state_path" session_count)
+  last_boot=$(watchdog_state_value "$state_path" boot_id)
+  current_boot=$(boot_id)
+
+  case "$last_session_count" in
+    ''|*[!0-9]*)
+      last_session_count=0
+      ;;
+  esac
+
+  if [ "$last_session_count" -le 0 ] || [ -z "$last_seen_epoch" ]; then
+    watchdog_log "$snapshot_name" "no live tmux sessions and no prior live heartbeat; restore skipped."
+    return 0
+  fi
+
+  snapshot_path=$(restore_snapshot_path_for "$snapshot_name")
+  if [ ! -f "$snapshot_path" ]; then
+    local no_snapshot_reason="tmux sessions disappeared after $last_session_count session(s), but no snapshot exists at $snapshot_path."
+    watchdog_log "$snapshot_name" "$no_snapshot_reason"
+    write_watchdog_incident "$snapshot_name" "skip_no_snapshot" "unknown" "$no_snapshot_reason" "$last_seen_epoch" "$last_seen_iso" "$last_session_count" ""
+    return 0
+  fi
+
+  local close_context="tmux sessions disappeared after $last_session_count session(s) last seen at ${last_seen_iso:-$last_seen_epoch}"
+  if [ -n "$last_boot" ] && [ -n "$current_boot" ] && [ "$last_boot" != "$current_boot" ]; then
+    close_context="$close_context; boot id changed from $last_boot to $current_boot"
+  fi
+
+  local diagnostic_report capacity_report capacity_found=0
+  diagnostic_report=$(watchdog_diagnostic_report_since "$snapshot_name" "$last_seen_epoch" "$last_boot" "$current_boot" || true)
+  if capacity_report=$(watchdog_capacity_report_since "$last_seen_epoch"); then
+    capacity_found=1
+  fi
+
+  if [ "$capacity_found" -eq 1 ]; then
+    watchdog_log "$snapshot_name" "$close_context; capacity evidence found, restore skipped."
+    watchdog_log_block "$snapshot_name" "$diagnostic_report"
+    watchdog_log_block "$snapshot_name" "$capacity_report"
+    write_watchdog_incident "$snapshot_name" "skip_capacity" "1" "$close_context" "$last_seen_epoch" "$last_seen_iso" "$last_session_count" "restore skipped"
+    return 0
+  fi
+
+  if [ "$restore_enabled" -eq 0 ]; then
+    watchdog_log "$snapshot_name" "$close_context; no capacity evidence found, restore disabled."
+    watchdog_log_block "$snapshot_name" "$diagnostic_report"
+    write_watchdog_incident "$snapshot_name" "skip_restore_disabled" "0" "$close_context" "$last_seen_epoch" "$last_seen_iso" "$last_session_count" "restore disabled"
+    return 0
+  fi
+
+  watchdog_log "$snapshot_name" "$close_context; no capacity evidence found, restoring $snapshot_name."
+  watchdog_log_block "$snapshot_name" "$diagnostic_report"
+
+  local -a restore_args=()
+  if [ "$restart_processes" = "1" ]; then
+    restore_args+=(--restart-processes)
+  else
+    restore_args+=(--no-restart-processes)
+  fi
+  if [ "$restart_codex" = "1" ]; then
+    restore_args+=(--restart-codex)
+  else
+    restore_args+=(--no-restart-codex)
+  fi
+
+  cmd_autorestore "${restore_args[@]}" "$snapshot_name"
+
+  if tmux_has_sessions; then
+    write_watchdog_heartbeat "$snapshot_name"
+    watchdog_log "$snapshot_name" "restore completed and heartbeat refreshed."
+    write_watchdog_incident "$snapshot_name" "restore" "0" "$close_context" "$last_seen_epoch" "$last_seen_iso" "$last_session_count" "restore completed"
+  fi
+}
+
+codex_restore_command() {
+  local thread_id="$1"
+  local cwd="$2"
+  local cmd
+
+  is_uuid_like "$thread_id" || return 0
+  cmd=$(byobu_codex_cmd || true)
+  [ -n "$cmd" ] || return 0
+
+  shell_join "$cmd" run --thread "$thread_id" --cwd "$cwd"
+}
+
+restore_codex_dedupe_enabled() {
+  truthy "${BYOBU_SESSION_DEDUP_CODEX_RESTORE:-1}"
+}
+
+append_restore_codex_resumed_thread() {
+  local thread_id="$1"
+  case " $restore_codex_resumed_threads " in
+    *" $thread_id "*) ;;
+    *)
+      if [ -z "$restore_codex_resumed_threads" ]; then
+        restore_codex_resumed_threads="$thread_id"
+      else
+        restore_codex_resumed_threads="$restore_codex_resumed_threads $thread_id"
+      fi
+      ;;
+  esac
+}
+
+append_restore_codex_suppressed_thread() {
+  local thread_id="$1"
+  case " $restore_codex_suppressed_threads " in
+    *" $thread_id "*) ;;
+    *)
+      if [ -z "$restore_codex_suppressed_threads" ]; then
+        restore_codex_suppressed_threads="$thread_id"
+      else
+        restore_codex_suppressed_threads="$restore_codex_suppressed_threads $thread_id"
+      fi
+      ;;
+  esac
+}
+
+snapshot_codex_thread_ids() {
+  local snapshot_path="$1"
+  awk -F= '/^window_codex_thread_ids\[[0-9][0-9]*\]=/ { print $2 }' "$snapshot_path" 2>/dev/null \
+    | while IFS= read -r thread_id; do
+        if is_uuid_like "$thread_id"; then
+          printf '%s\n' "$thread_id"
+        fi
+      done
+}
+
+restore_codex_should_start() {
+  local target_session="$1"
+  local thread_id="$2"
+
+  [ -n "$thread_id" ] || return 0
+  restore_codex_dedupe_enabled || return 0
+
+  if [ -n "${restore_codex_started_threads[$thread_id]+x}" ]; then
+    printf 'already-started'
+    return 1
+  fi
+
+  if [ -n "$restore_codex_preferred_session" ] \
+    && [ "$target_session" != "$restore_codex_preferred_session" ] \
+    && [ -n "${restore_codex_preferred_threads[$thread_id]+x}" ]; then
+    printf 'preferred-session:%s' "$restore_codex_preferred_session"
+    return 1
+  fi
+
+  return 0
 }
 
 restore_window() {
   local target_session="$1"
   local array_index="$2"
   local restart_processes="$3"
+  local restart_codex="$4"
   local window_name="${window_names[$array_index]}"
   local window_layout="${window_layouts[$array_index]}"
   local active_pane_index="${window_active_panes[$array_index]}"
   local pane_count="${window_pane_counts[$array_index]}"
+  local codex_thread_id="${window_codex_thread_ids[$array_index]:-}"
+  local codex_cwd="${window_codex_cwds[$array_index]:-}"
   local pane_paths_var="window_${array_index}_pane_paths"
   local pane_commands_var="window_${array_index}_pane_restart_commands"
   local -n pane_paths_ref="$pane_paths_var"
@@ -274,6 +1553,7 @@ restore_window() {
 
   local first_path
   first_path=$(safe_path "${pane_paths_ref[0]:-$HOME}")
+  [ -n "$codex_cwd" ] || codex_cwd="$first_path"
 
   if [ "$array_index" -eq 0 ]; then
     local launcher
@@ -295,9 +1575,39 @@ restore_window() {
 
   tmux select-layout -t "$target_window" "$window_layout" >/dev/null 2>&1 || true
 
+  local codex_started=0
+  if is_uuid_like "$codex_thread_id"; then
+    tmux set-option -wq -t "$target_window" '@byobu-codex' '1' >/dev/null 2>&1 || true
+    tmux set-option -wq -t "$target_window" '@byobu-codex-mode' 'resume' >/dev/null 2>&1 || true
+    tmux set-option -wq -t "$target_window" '@byobu-codex-thread-id' "$codex_thread_id" >/dev/null 2>&1 || true
+    tmux set-option -wq -t "$target_window" '@byobu-codex-cwd' "$codex_cwd" >/dev/null 2>&1 || true
+    tmux set-option -wq -t "$target_window" '@byobu-codex-resume' '1' >/dev/null 2>&1 || true
+
+    if [ "$restart_codex" = "1" ]; then
+      local resume_command suppress_reason=""
+      if ! suppress_reason=$(restore_codex_should_start "$target_session" "$codex_thread_id"); then
+        tmux set-option -wq -t "$target_window" '@byobu-codex-resume' '0' >/dev/null 2>&1 || true
+        tmux set-option -wq -t "$target_window" '@byobu-codex-dedup-suppressed' "$suppress_reason" >/dev/null 2>&1 || true
+        append_restore_codex_suppressed_thread "$codex_thread_id"
+      else
+        resume_command=$(codex_restore_command "$codex_thread_id" "$codex_cwd")
+        if [ -n "$resume_command" ]; then
+          tmux send-keys -t "${target_window}.0" "$resume_command" Enter
+          codex_started=1
+          restore_codex_started_threads["$codex_thread_id"]=1
+          append_restore_codex_resumed_thread "$codex_thread_id"
+        fi
+      fi
+    fi
+  fi
+
   if [ "$restart_processes" = "1" ]; then
     local restart_pane_idx=0
     while [ "$restart_pane_idx" -lt "$pane_count" ]; do
+      if [ "$codex_started" = "1" ] && [ "$restart_pane_idx" -eq 0 ]; then
+        restart_pane_idx=$((restart_pane_idx + 1))
+        continue
+      fi
       local restart_command="${pane_commands_ref[$restart_pane_idx]:-}"
       if [ -n "$restart_command" ]; then
         tmux send-keys -t "${target_window}.${restart_pane_idx}" "$restart_command" Enter
@@ -309,11 +1619,63 @@ restore_window() {
   tmux select-pane -t "${target_window}.${active_pane_index}" >/dev/null 2>&1 || true
 }
 
+print_loaded_snapshot_restore_plan() {
+  local snapshot_path="$1"
+  local target_session="$2"
+  local restart_processes="$3"
+  local restart_codex="$4"
+  local target_exists="$5"
+
+  printf 'Restore plan:\n'
+  printf '  snapshot: %s\n' "$snapshot_path"
+  printf '  target_session: %s\n' "$target_session"
+  printf '  target_exists: %s\n' "$target_exists"
+  printf '  restart_processes: %s\n' "$restart_processes"
+  printf '  restart_codex: %s\n' "$restart_codex"
+  printf '  window_count: %s\n' "$window_count"
+  printf '  active_window_position: %s\n' "$active_window_position"
+
+  local i=0
+  while [ "$i" -lt "$window_count" ]; do
+    local pane_paths_var="window_${i}_pane_paths"
+    local pane_commands_var="window_${i}_pane_restart_commands"
+    local -n pane_paths_ref="$pane_paths_var"
+    local -n pane_commands_ref="$pane_commands_var"
+    local window_name="${window_names[$i]}"
+    local pane_count="${window_pane_counts[$i]}"
+    local first_path="${pane_paths_ref[0]:-$HOME}"
+    local active_pane="${window_active_panes[$i]}"
+    local codex_thread_id="${window_codex_thread_ids[$i]:-}"
+    local codex_cwd="${window_codex_cwds[$i]:-}"
+
+    printf '  window[%s]: name=%s panes=%s cwd=%s active_pane=%s' "$i" "$window_name" "$pane_count" "$first_path" "$active_pane"
+    if is_uuid_like "$codex_thread_id"; then
+      [ -n "$codex_cwd" ] || codex_cwd="$first_path"
+      printf ' codex_thread_id=%s codex_cwd=%s' "$codex_thread_id" "$codex_cwd"
+    fi
+    if [ "$restart_processes" = "1" ]; then
+      local restart_count=0 pane_idx=0
+      while [ "$pane_idx" -lt "$pane_count" ]; do
+        [ -n "${pane_commands_ref[$pane_idx]:-}" ] && restart_count=$((restart_count + 1))
+        pane_idx=$((pane_idx + 1))
+      done
+      printf ' restart_commands=%s' "$restart_count"
+    fi
+    printf '\n'
+    i=$((i + 1))
+  done
+}
+
 cmd_restore() {
   ensure_tmux
   local restart_processes=0
+  local restart_codex=1
+  local dry_run=0
   if truthy "${BYOBU_SESSION_RESTART_PROCESSES:-0}"; then
     restart_processes=1
+  fi
+  if ! truthy "${BYOBU_SESSION_RESTART_CODEX:-1}"; then
+    restart_codex=0
   fi
 
   local -a args=()
@@ -325,6 +1687,18 @@ cmd_restore() {
         ;;
       --no-restart-processes)
         restart_processes=0
+        shift
+        ;;
+      --restart-codex)
+        restart_codex=1
+        shift
+        ;;
+      --no-restart-codex)
+        restart_codex=0
+        shift
+        ;;
+      --dry-run)
+        dry_run=1
         shift
         ;;
       --)
@@ -352,7 +1726,7 @@ cmd_restore() {
   validate_snapshot_name "$snapshot_name"
 
   local snapshot_path
-  snapshot_path=$(snapshot_path_for "$snapshot_name")
+  snapshot_path=$(restore_snapshot_path_for "$snapshot_name")
   [ -f "$snapshot_path" ] || fail "snapshot not found: $snapshot_path"
   validate_snapshot_file_trust "$snapshot_path"
 
@@ -361,18 +1735,249 @@ cmd_restore() {
 
   local target_session="${2:-$session_name}"
   validate_session_name "$target_session"
+  local target_exists="no"
   if tmux has-session -t "$target_session" 2>/dev/null; then
+    target_exists="yes"
+    if [ "$dry_run" = "1" ]; then
+      print_loaded_snapshot_restore_plan "$snapshot_path" "$target_session" "$restart_processes" "$restart_codex" "$target_exists"
+      return 0
+    fi
     fail "target session already exists: $target_session"
+  fi
+
+  if [ "$dry_run" = "1" ]; then
+    print_loaded_snapshot_restore_plan "$snapshot_path" "$target_session" "$restart_processes" "$restart_codex" "$target_exists"
+    return 0
   fi
 
   local i=0
   while [ "$i" -lt "$window_count" ]; do
-    restore_window "$target_session" "$i" "$restart_processes"
+    restore_window "$target_session" "$i" "$restart_processes" "$restart_codex"
     i=$((i + 1))
   done
 
   tmux select-window -t "${target_session}:${active_window_position}" >/dev/null 2>&1 || true
   printf 'Restored tmux session %s from %s\n' "$target_session" "$snapshot_path"
+}
+
+restore_autosave_sessions() {
+  local snapshot_name="$1"
+  local restart_processes="$2"
+  local restart_codex="$3"
+  local manifest
+  manifest=$(autosave_sessions_manifest_path_for "$snapshot_name")
+  [ -f "$manifest" ] || return 1
+  validate_snapshot_file_trust "$manifest"
+
+  local primary_session=""
+  local -a sessions=()
+  local -a snapshots=()
+  local kind session per_snapshot extra
+
+  while IFS=$'\t' read -r kind session per_snapshot extra; do
+    case "$kind" in
+      ''|\#*)
+        continue
+        ;;
+      primary)
+        [ -n "${session:-}" ] || fail "invalid autosave sessions manifest: missing primary session"
+        validate_session_name "$session"
+        primary_session="$session"
+        ;;
+      snapshot)
+        [ -n "${session:-}" ] || fail "invalid autosave sessions manifest: missing session"
+        [ -n "${per_snapshot:-}" ] || fail "invalid autosave sessions manifest: missing snapshot"
+        [ -z "${extra:-}" ] || fail "invalid autosave sessions manifest: too many columns"
+        validate_session_name "$session"
+        validate_snapshot_name "$per_snapshot"
+        sessions+=("$session")
+        snapshots+=("$per_snapshot")
+        ;;
+      *)
+        fail "invalid autosave sessions manifest entry: $kind"
+        ;;
+    esac
+  done < "$manifest"
+
+  [ "${#sessions[@]}" -gt 0 ] || return 1
+
+  local -a restore_args=()
+  if [ "$restart_processes" = "1" ]; then
+    restore_args+=(--restart-processes)
+  else
+    restore_args+=(--no-restart-processes)
+  fi
+  if [ "$restart_codex" = "1" ]; then
+    restore_args+=(--restart-codex)
+  else
+    restore_args+=(--no-restart-codex)
+  fi
+
+  local restored=0
+  local idx path
+
+  restore_codex_preferred_session=""
+  restore_codex_resumed_threads=""
+  restore_codex_suppressed_threads=""
+  restore_codex_started_threads=()
+  restore_codex_preferred_threads=()
+
+  if [ "$restart_codex" = "1" ] && restore_codex_dedupe_enabled && [ -n "$primary_session" ]; then
+    local primary_snapshot primary_path preferred_thread
+    primary_snapshot=""
+    for idx in "${!sessions[@]}"; do
+      if [ "${sessions[$idx]}" = "$primary_session" ]; then
+        primary_snapshot="${snapshots[$idx]}"
+        break
+      fi
+    done
+    if [ -n "$primary_snapshot" ]; then
+      primary_path=$(restore_snapshot_path_for "$primary_snapshot")
+      if [ -f "$primary_path" ]; then
+        restore_codex_preferred_session="$primary_session"
+        while IFS= read -r preferred_thread; do
+          restore_codex_preferred_threads["$preferred_thread"]=1
+        done < <(snapshot_codex_thread_ids "$primary_path")
+      fi
+    fi
+  fi
+
+  for idx in "${!sessions[@]}"; do
+    if [ -n "$primary_session" ] && [ "${sessions[$idx]}" = "$primary_session" ]; then
+      continue
+    fi
+    path=$(restore_snapshot_path_for "${snapshots[$idx]}")
+    [ -f "$path" ] || continue
+    cmd_restore "${restore_args[@]}" "${snapshots[$idx]}" "${sessions[$idx]}"
+    restored=$((restored + 1))
+  done
+
+  for idx in "${!sessions[@]}"; do
+    if [ -n "$primary_session" ] && [ "${sessions[$idx]}" != "$primary_session" ]; then
+      continue
+    fi
+    path=$(restore_snapshot_path_for "${snapshots[$idx]}")
+    [ -f "$path" ] || continue
+    cmd_restore "${restore_args[@]}" "${snapshots[$idx]}" "${sessions[$idx]}"
+    restored=$((restored + 1))
+  done
+
+  [ "$restored" -gt 0 ]
+}
+
+cmd_autorestore() {
+  ensure_tmux
+
+  local restart_processes=0
+  local restart_codex=1
+  local dry_run=0
+  if truthy "${BYOBU_SESSION_RESTART_PROCESSES:-0}" || truthy "${BYOBU_SESSION_AUTO_RESTART_PROCESSES:-0}"; then
+    restart_processes=1
+  fi
+  if ! truthy "${BYOBU_SESSION_RESTART_CODEX:-1}" || ! truthy "${BYOBU_SESSION_AUTO_RESTART_CODEX:-1}"; then
+    restart_codex=0
+  fi
+
+  local -a args=()
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --restart-processes)
+        restart_processes=1
+        shift
+        ;;
+      --no-restart-processes)
+        restart_processes=0
+        shift
+        ;;
+      --restart-codex)
+        restart_codex=1
+        shift
+        ;;
+      --no-restart-codex)
+        restart_codex=0
+        shift
+        ;;
+      --dry-run)
+        dry_run=1
+        shift
+        ;;
+      --)
+        shift
+        while [ "$#" -gt 0 ]; do
+          args+=("$1")
+          shift
+        done
+        ;;
+      --*)
+        fail_usage "unknown autorestore option: $1"
+        ;;
+      *)
+        args+=("$1")
+        shift
+        ;;
+    esac
+  done
+  set -- "${args[@]}"
+
+  [ "$#" -le 2 ] || fail_usage "autorestore accepts at most 2 arguments"
+
+  local snapshot_name="${1:-}"
+  if [ -z "$snapshot_name" ]; then
+    snapshot_name=$(default_autosave_snapshot_name)
+  fi
+  validate_snapshot_name "$snapshot_name"
+
+  if tmux_has_sessions; then
+    if [ "$dry_run" = "1" ]; then
+      printf 'Autorestore dry-run: live tmux/byobu sessions already exist; restore would be skipped.\n'
+      print_autosave_restore_plan "$snapshot_name"
+      return 0
+    fi
+    printf 'Live tmux/byobu sessions already exist; autorestore skipped.\n'
+    return 0
+  fi
+
+  local snapshot_path
+  snapshot_path=$(restore_snapshot_path_for "$snapshot_name")
+  if [ ! -f "$snapshot_path" ]; then
+    if [ "$dry_run" = "1" ]; then
+      printf 'Autorestore dry-run: no autosave snapshot to restore at %s\n' "$snapshot_path"
+      print_autosave_restore_plan "$snapshot_name"
+      return 0
+    fi
+    printf 'No autosave snapshot to restore at %s\n' "$snapshot_path"
+    return 0
+  fi
+
+  if [ "$dry_run" = "1" ]; then
+    printf 'Autorestore dry-run: no live tmux/byobu sessions; restore would run.\n'
+    print_autosave_restore_plan "$snapshot_name"
+    return 0
+  fi
+
+  if [ -z "${2:-}" ] && truthy "${BYOBU_SESSION_RESTORE_ALL_AUTOSAVES:-1}"; then
+    if restore_autosave_sessions "$snapshot_name" "$restart_processes" "$restart_codex"; then
+      return 0
+    fi
+  fi
+
+  local -a restore_args=()
+  if [ "$restart_processes" = "1" ]; then
+    restore_args+=(--restart-processes)
+  else
+    restore_args+=(--no-restart-processes)
+  fi
+  if [ "$restart_codex" = "1" ]; then
+    restore_args+=(--restart-codex)
+  else
+    restore_args+=(--no-restart-codex)
+  fi
+  restore_args+=("$snapshot_name")
+  if [ -n "${2:-}" ]; then
+    restore_args+=("$2")
+  fi
+
+  cmd_restore "${restore_args[@]}"
 }
 
 cmd_list() {
@@ -388,20 +1993,183 @@ cmd_list() {
   done
 }
 
+cmd_status() {
+  [ "$#" -eq 0 ] || fail_usage "status does not accept arguments"
+
+  printf 'Snapshot directory: %s\n' "$snapshot_root"
+  if compgen -G "$snapshot_root/*.snapshot" >/dev/null; then
+    printf 'Snapshots:\n'
+    local snapshot
+    for snapshot in "$snapshot_root"/*.snapshot; do
+      printf '  %s\n' "$(basename "${snapshot%.snapshot}")"
+    done
+  else
+    printf 'Snapshots: none\n'
+  fi
+
+  if ! tmux_has_sessions; then
+    printf 'Live tmux/byobu sessions: none\n'
+    return 0
+  fi
+
+  printf 'Live tmux/byobu sessions:\n'
+  tmux list-sessions -F '  #{session_name} windows=#{session_windows} attached=#{session_attached}'
+  printf 'Live windows:\n'
+  tmux list-windows -a -F '  #{session_name}:#{window_index} #{window_name} cwd=#{pane_current_path} cmd=#{pane_current_command}'
+}
+
+cmd_incidents() {
+  [ "$#" -le 1 ] || fail_usage "incidents accepts at most 1 argument"
+
+  local snapshot_name="${1:-}"
+  if [ -z "$snapshot_name" ]; then
+    snapshot_name=$(default_autosave_snapshot_name)
+  fi
+  validate_snapshot_name "$snapshot_name"
+
+  local incident_path
+  incident_path=$(watchdog_incident_path_for "$snapshot_name")
+  if [ ! -f "$incident_path" ]; then
+    printf 'No watchdog incident recorded for %s at %s\n' "$snapshot_name" "$incident_path"
+    return 0
+  fi
+
+  printf 'Watchdog incident for %s:\n' "$snapshot_name"
+  awk -F '\t' 'NF >= 2 { printf "  %s: %s\n", $1, $2 }' "$incident_path"
+}
+
+cmd_doctor() {
+  [ "$#" -le 1 ] || fail_usage "doctor accepts at most 1 argument"
+
+  local snapshot_name="${1:-}"
+  if [ -z "$snapshot_name" ]; then
+    snapshot_name=$(default_autosave_snapshot_name)
+  fi
+  validate_snapshot_name "$snapshot_name"
+
+  printf 'Byobu session state doctor\n'
+  printf 'Version: %s\n' "$version"
+  printf 'Snapshot directory: %s\n' "$snapshot_root"
+  print_lock_status
+  print_command_summary
+  print_systemd_summary
+  print_autosave_restore_plan "$snapshot_name"
+  print_unreferenced_autosave_session_snapshots "$snapshot_name"
+  print_watchdog_summary "$snapshot_name"
+  print_live_sessions_summary
+}
+
+cmd_prune() {
+  local delete=0
+  local -a args=()
+
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --dry-run)
+        delete=0
+        shift
+        ;;
+      --delete)
+        delete=1
+        shift
+        ;;
+      --)
+        shift
+        while [ "$#" -gt 0 ]; do
+          args+=("$1")
+          shift
+        done
+        ;;
+      --*)
+        fail_usage "unknown prune option: $1"
+        ;;
+      *)
+        args+=("$1")
+        shift
+        ;;
+    esac
+  done
+  set -- "${args[@]}"
+
+  [ "$#" -le 1 ] || fail_usage "prune accepts at most 1 argument"
+
+  local snapshot_name="${1:-}"
+  if [ -z "$snapshot_name" ]; then
+    snapshot_name=$(default_autosave_snapshot_name)
+  fi
+  validate_snapshot_name "$snapshot_name"
+
+  local mode="dry-run"
+  [ "$delete" = "1" ] && mode="delete"
+  printf 'Prune autosave session snapshots for %s mode=%s\n' "$snapshot_name" "$mode"
+
+  local base path found=0 path_found=0
+  while IFS= read -r base; do
+    [ -n "$base" ] || continue
+    found=1
+    while IFS= read -r path; do
+      [ -e "$path" ] || continue
+      path_found=1
+      if [ "$delete" = "1" ]; then
+        rm -f -- "$path"
+        printf 'Deleted %s\n' "$path"
+      else
+        printf 'Would delete %s\n' "$path"
+      fi
+    done < <(autosave_session_snapshot_paths_for_base "$base")
+  done < <(unreferenced_autosave_session_snapshot_bases "$snapshot_name")
+
+  if [ "$found" -eq 0 ] || [ "$path_found" -eq 0 ]; then
+    printf 'Nothing to prune for %s\n' "$snapshot_name"
+  fi
+}
+
 main() {
   local cmd="${1:-}"
+  if requires_state_lock "$cmd"; then
+    acquire_state_lock "$@"
+  fi
+
   case "$cmd" in
     save)
       shift
       cmd_save "$@"
       ;;
+    autosave|auto-save)
+      shift
+      cmd_autosave "$@"
+      ;;
+    autorestore|auto-restore)
+      shift
+      cmd_autorestore "$@"
+      ;;
+    watchdog|watch)
+      shift
+      cmd_watchdog "$@"
+      ;;
     restore)
       shift
       cmd_restore "$@"
       ;;
+    doctor)
+      shift
+      cmd_doctor "$@"
+      ;;
+    prune)
+      shift
+      cmd_prune "$@"
+      ;;
     list)
       shift
       cmd_list "$@"
+      ;;
+    status)
+      shift
+      cmd_status "$@"
+      ;;
+    incidents|incident)
+      shift
+      cmd_incidents "$@"
       ;;
     --version|version)
       printf 'byobu-session-state %s\n' "$version"
