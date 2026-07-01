@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-version="0.6.0"
+version="0.7.0"
 snapshot_root="${BYOBU_SESSION_STATE_DIR:-$HOME/.local/state/byobu-session-state}"
 declare -A restore_codex_started_threads=()
 declare -A restore_codex_preferred_threads=()
@@ -17,6 +17,7 @@ Usage:
   byobu-session-state autorestore [--dry-run] [--restart-codex|--no-restart-codex] [--restart-processes] [snapshot_name] [target_session]
   byobu-session-state watchdog [--restart-codex|--no-restart-codex] [--restart-processes] [--no-restore] [snapshot_name]
   byobu-session-state restore [--dry-run] [--restart-codex|--no-restart-codex] [--restart-processes] <snapshot_name> [target_session]
+  byobu-session-state validate [snapshot_name]
   byobu-session-state doctor [snapshot_name]
   byobu-session-state prune [--dry-run|--delete] [snapshot_name]
   byobu-session-state list
@@ -36,6 +37,7 @@ Examples:
   byobu-session-state restore --restart-processes work
   byobu-session-state watchdog
   byobu-session-state restore work restored-work
+  byobu-session-state validate
   byobu-session-state doctor
   byobu-session-state prune
   byobu-session-state prune --delete
@@ -369,6 +371,21 @@ byobu_codex_cmd() {
   fi
 }
 
+byobu_session_plan_cmd() {
+  local script_dir
+  script_dir=$(cd "$(dirname "$0")" && pwd)
+
+  if [ -x "$script_dir/byobu-session-plan" ]; then
+    printf '%s\n' "$script_dir/byobu-session-plan"
+  elif command -v byobu-session-plan >/dev/null 2>&1; then
+    command -v byobu-session-plan
+  elif [ -x "$HOME/.local/bin/byobu-session-plan" ]; then
+    printf '%s\n' "$HOME/.local/bin/byobu-session-plan"
+  else
+    return 1
+  fi
+}
+
 adopt_codex_tabs() {
   local session_name="$1"
   local cmd
@@ -578,6 +595,13 @@ autosave_session_snapshot_paths_for_base() {
 print_autosave_restore_plan() {
   local snapshot_name="$1"
   local manifest primary_session kind session per_snapshot extra path status found=0
+  local planner
+
+  if planner=$(byobu_session_plan_cmd); then
+    "$planner" autosave --snapshot-root "$snapshot_root" --snapshot-name "$snapshot_name"
+    return 0
+  fi
+
   manifest=$(autosave_sessions_manifest_path_for "$snapshot_name")
 
   printf 'Autosave restore plan for %s:\n' "$snapshot_name"
@@ -630,6 +654,12 @@ print_autosave_restore_plan() {
 print_unreferenced_autosave_session_snapshots() {
   local snapshot_name="$1"
   local base path found=0
+  local planner
+
+  if planner=$(byobu_session_plan_cmd); then
+    "$planner" unreferenced --snapshot-root "$snapshot_root" --snapshot-name "$snapshot_name"
+    return 0
+  fi
 
   printf 'Unreferenced autosave session snapshots for %s:\n' "$snapshot_name"
   while IFS= read -r base; do
@@ -743,6 +773,289 @@ print_live_sessions_summary() {
     return 0
   fi
   tmux list-sessions -F '  #{session_name} windows=#{session_windows} attached=#{session_attached} activity=#{session_activity}'
+}
+
+validation_errors=0
+validation_warnings=0
+
+validation_error() {
+  validation_errors=$((validation_errors + 1))
+  printf 'ERROR: %s\n' "$*"
+}
+
+validation_warning() {
+  validation_warnings=$((validation_warnings + 1))
+  printf 'WARN: %s\n' "$*"
+}
+
+simple_snapshot_name_is_valid() {
+  local snapshot_name="$1"
+  [ -n "$snapshot_name" ] || return 1
+  case "$snapshot_name" in
+    */*|.*/*|..|.)
+      return 1
+      ;;
+  esac
+  return 0
+}
+
+session_name_is_valid() {
+  local session_name="$1"
+  [ -n "$session_name" ] || return 1
+  case "$session_name" in
+    *:*)
+      return 1
+      ;;
+  esac
+  return 0
+}
+
+unsigned_int() {
+  case "${1:-}" in
+    ''|*[!0-9]*)
+      return 1
+      ;;
+    *)
+      return 0
+      ;;
+  esac
+}
+
+snapshot_assignment_value() {
+  local snapshot_path="$1"
+  local key="$2"
+  awk -v key="$key" '
+    index($0, key "=") == 1 {
+      sub(/^[^=]*=/, "")
+      print
+      exit
+    }
+  ' "$snapshot_path" 2>/dev/null
+}
+
+snapshot_assignment_exists() {
+  local snapshot_path="$1"
+  local key="$2"
+  grep -Fq "$key=" "$snapshot_path" 2>/dev/null
+}
+
+shell_scalar_is_plain_path() {
+  local value="$1"
+  case "$value" in
+    *\\*|*\'*|*\"*|\$*)
+      return 1
+      ;;
+    *)
+      return 0
+      ;;
+  esac
+}
+
+validate_trusted_file_report() {
+  local path="$1"
+  local label="$2"
+  if [ ! -f "$path" ]; then
+    validation_error "$label missing: $path"
+    return 1
+  fi
+
+  if [ ! -O "$path" ]; then
+    validation_error "$label is not owned by the current user: $path"
+  fi
+
+  local mode group_mode other_mode
+  mode=$(stat -c '%a' "$path" 2>/dev/null || printf '')
+  if [ -n "$mode" ]; then
+    group_mode="${mode: -2:1}"
+    other_mode="${mode: -1}"
+    if [ $((group_mode & 2)) -ne 0 ] || [ $((other_mode & 2)) -ne 0 ]; then
+      validation_error "$label is group/world-writable: $path"
+    fi
+  fi
+}
+
+validate_snapshot_file_structure() {
+  local snapshot_name="$1"
+  local snapshot_path="$2"
+  local label="snapshot $snapshot_name"
+  printf 'Snapshot %s: %s\n' "$snapshot_name" "$snapshot_path"
+
+  validate_trusted_file_report "$snapshot_path" "$label" || return 0
+
+  if ! bash -n "$snapshot_path" >/dev/null 2>&1; then
+    validation_error "$label is not valid bash syntax"
+    return 0
+  fi
+
+  local schema session_value window_count active_window
+  schema=$(snapshot_assignment_value "$snapshot_path" snapshot_schema_version)
+  if [ -z "$schema" ]; then
+    validation_warning "$label has no snapshot_schema_version field; treating it as a legacy snapshot"
+  elif [ "$schema" != "1" ]; then
+    validation_error "$label has unsupported snapshot_schema_version=$schema"
+  fi
+
+  session_value=$(snapshot_assignment_value "$snapshot_path" session_name)
+  if [ -z "$session_value" ]; then
+    validation_error "$label missing session_name"
+  elif ! session_name_is_valid "$session_value"; then
+    validation_error "$label has unsupported session_name: $session_value"
+  fi
+
+  window_count=$(snapshot_assignment_value "$snapshot_path" window_count)
+  if ! unsigned_int "$window_count"; then
+    validation_error "$label has invalid window_count: ${window_count:-missing}"
+    return 0
+  fi
+  if [ "$window_count" -eq 0 ]; then
+    validation_error "$label has no windows"
+  fi
+
+  active_window=$(snapshot_assignment_value "$snapshot_path" active_window_position)
+  if ! unsigned_int "$active_window"; then
+    validation_error "$label has invalid active_window_position: ${active_window:-missing}"
+  elif [ "$window_count" -gt 0 ] && [ "$active_window" -ge "$window_count" ]; then
+    validation_error "$label active_window_position=$active_window is outside window_count=$window_count"
+  fi
+
+  snapshot_assignment_exists "$snapshot_path" "declare -a window_codex_thread_ids" \
+    || validation_warning "$label does not declare window_codex_thread_ids"
+  snapshot_assignment_exists "$snapshot_path" "declare -a window_codex_cwds" \
+    || validation_warning "$label does not declare window_codex_cwds"
+
+  local -A seen_threads=()
+  local i pane_count active_pane pane_idx pane_path codex_thread_id
+  i=0
+  while [ "$i" -lt "$window_count" ]; do
+    snapshot_assignment_exists "$snapshot_path" "window_names[$i]" \
+      || validation_error "$label missing window_names[$i]"
+    snapshot_assignment_exists "$snapshot_path" "window_layouts[$i]" \
+      || validation_error "$label missing window_layouts[$i]"
+
+    pane_count=$(snapshot_assignment_value "$snapshot_path" "window_pane_counts[$i]")
+    if ! unsigned_int "$pane_count"; then
+      validation_error "$label has invalid window_pane_counts[$i]: ${pane_count:-missing}"
+      pane_count=0
+    elif [ "$pane_count" -eq 0 ]; then
+      validation_error "$label window[$i] has no panes"
+    fi
+
+    active_pane=$(snapshot_assignment_value "$snapshot_path" "window_active_panes[$i]")
+    if ! unsigned_int "$active_pane"; then
+      validation_error "$label has invalid window_active_panes[$i]: ${active_pane:-missing}"
+    elif [ "$pane_count" -gt 0 ] && [ "$active_pane" -ge "$pane_count" ]; then
+      validation_error "$label window[$i] active pane $active_pane is outside pane_count=$pane_count"
+    fi
+
+    pane_idx=0
+    while [ "$pane_idx" -lt "$pane_count" ]; do
+      pane_path=$(snapshot_assignment_value "$snapshot_path" "window_${i}_pane_paths[$pane_idx]")
+      if [ -z "$pane_path" ]; then
+        validation_error "$label missing window_${i}_pane_paths[$pane_idx]"
+      elif shell_scalar_is_plain_path "$pane_path" && [ ! -d "$pane_path" ]; then
+        validation_warning "$label pane path no longer exists: window[$i].pane[$pane_idx] cwd=$pane_path"
+      fi
+      snapshot_assignment_exists "$snapshot_path" "window_${i}_pane_restart_commands[$pane_idx]" \
+        || validation_warning "$label missing window_${i}_pane_restart_commands[$pane_idx]"
+      pane_idx=$((pane_idx + 1))
+    done
+
+    codex_thread_id=$(snapshot_assignment_value "$snapshot_path" "window_codex_thread_ids[$i]")
+    if [ -n "$codex_thread_id" ]; then
+      if ! is_uuid_like "$codex_thread_id"; then
+        validation_error "$label has invalid Codex thread id at window[$i]: $codex_thread_id"
+      elif [ -n "${seen_threads[$codex_thread_id]+x}" ]; then
+        validation_warning "$label has duplicate Codex thread id: $codex_thread_id"
+      else
+        seen_threads["$codex_thread_id"]=1
+      fi
+    fi
+
+    i=$((i + 1))
+  done
+}
+
+validate_autosave_manifest_file() {
+  local snapshot_name="$1"
+  local manifest="$2"
+  printf 'Autosave manifest: %s\n' "$manifest"
+  validate_trusted_file_report "$manifest" "autosave manifest $snapshot_name" || return 0
+
+  local primary_session="" kind session per_snapshot extra line_no=0 snapshot_path
+  local -a sessions=()
+  local -a snapshots=()
+  local -A seen_sessions=()
+  local -A seen_snapshots=()
+
+  while IFS=$'\t' read -r kind session per_snapshot extra; do
+    line_no=$((line_no + 1))
+    case "$kind" in
+      ''|\#*)
+        continue
+        ;;
+      primary)
+        if [ -n "$primary_session" ]; then
+          validation_error "autosave manifest $snapshot_name has multiple primary entries"
+        fi
+        if ! session_name_is_valid "${session:-}"; then
+          validation_error "autosave manifest $snapshot_name line $line_no has invalid primary session: ${session:-missing}"
+        fi
+        primary_session="${session:-}"
+        ;;
+      snapshot)
+        if ! session_name_is_valid "${session:-}"; then
+          validation_error "autosave manifest $snapshot_name line $line_no has invalid session: ${session:-missing}"
+        fi
+        if ! simple_snapshot_name_is_valid "${per_snapshot:-}"; then
+          validation_error "autosave manifest $snapshot_name line $line_no has invalid snapshot name: ${per_snapshot:-missing}"
+        fi
+        if [ -n "${extra:-}" ]; then
+          validation_error "autosave manifest $snapshot_name line $line_no has too many columns"
+        fi
+        if [ -n "${session:-}" ] && [ -n "${seen_sessions[$session]+x}" ]; then
+          validation_warning "autosave manifest $snapshot_name repeats session: $session"
+        fi
+        if [ -n "${per_snapshot:-}" ] && [ -n "${seen_snapshots[$per_snapshot]+x}" ]; then
+          validation_warning "autosave manifest $snapshot_name repeats snapshot: $per_snapshot"
+        fi
+        [ -z "${session:-}" ] || seen_sessions["$session"]=1
+        [ -z "${per_snapshot:-}" ] || seen_snapshots["$per_snapshot"]=1
+        sessions+=("${session:-}")
+        snapshots+=("${per_snapshot:-}")
+        case "${per_snapshot:-}" in
+          "$snapshot_name".session.*) ;;
+          *)
+            validation_warning "autosave manifest $snapshot_name references non-standard per-session snapshot: ${per_snapshot:-missing}"
+            ;;
+        esac
+        ;;
+      *)
+        validation_error "autosave manifest $snapshot_name line $line_no has invalid entry type: $kind"
+        ;;
+    esac
+  done < "$manifest"
+
+  if [ -z "$primary_session" ]; then
+    validation_error "autosave manifest $snapshot_name has no primary entry"
+  elif [ -z "${seen_sessions[$primary_session]+x}" ]; then
+    validation_error "autosave manifest $snapshot_name primary session is not listed as a snapshot: $primary_session"
+  fi
+
+  if [ "${#snapshots[@]}" -eq 0 ]; then
+    validation_error "autosave manifest $snapshot_name has no session snapshots"
+    return 0
+  fi
+
+  local idx
+  for idx in "${!snapshots[@]}"; do
+    [ -n "${snapshots[$idx]}" ] || continue
+    snapshot_path=$(restore_snapshot_path_for "${snapshots[$idx]}")
+    if [ ! -f "$snapshot_path" ]; then
+      validation_error "autosave manifest $snapshot_name references missing snapshot ${snapshots[$idx]} for session ${sessions[$idx]} at $snapshot_path"
+      continue
+    fi
+    validate_snapshot_file_structure "${snapshots[$idx]}" "$snapshot_path"
+  done
 }
 
 is_shell_name() {
@@ -1086,7 +1399,8 @@ cmd_save() {
   local active_window_index
   active_window_index=$(tmux display-message -p -t "$session_name" '#I')
 
-  printf 'session_name=%q\n' "$session_name" > "$tmp"
+  printf 'snapshot_schema_version=%q\n' "1" > "$tmp"
+  printf 'session_name=%q\n' "$session_name" >> "$tmp"
   printf 'active_window_position=%q\n' "0" >> "$tmp"
   printf 'declare -a window_codex_thread_ids=()\n' >> "$tmp"
   printf 'declare -a window_codex_cwds=()\n' >> "$tmp"
@@ -1666,6 +1980,25 @@ print_loaded_snapshot_restore_plan() {
   done
 }
 
+print_snapshot_restore_plan() {
+  local snapshot_name="$1"
+  local snapshot_path="$2"
+  local target_session="$3"
+  local restart_processes="$4"
+  local restart_codex="$5"
+  local planner
+
+  planner=$(byobu_session_plan_cmd) || return 127
+  "$planner" restore \
+    --snapshot-root "$snapshot_root" \
+    --snapshot-name "$snapshot_name" \
+    --snapshot-path "$snapshot_path" \
+    --target-session "$target_session" \
+    --check-target \
+    --restart-processes "$restart_processes" \
+    --restart-codex "$restart_codex"
+}
+
 cmd_restore() {
   ensure_tmux
   local restart_processes=0
@@ -1729,6 +2062,17 @@ cmd_restore() {
   snapshot_path=$(restore_snapshot_path_for "$snapshot_name")
   [ -f "$snapshot_path" ] || fail "snapshot not found: $snapshot_path"
   validate_snapshot_file_trust "$snapshot_path"
+
+  if [ "$dry_run" = "1" ]; then
+    local plan_status=0
+    if print_snapshot_restore_plan "$snapshot_name" "$snapshot_path" "${2:-}" "$restart_processes" "$restart_codex"; then
+      return 0
+    fi
+    plan_status=$?
+    if [ "$plan_status" -ne 127 ]; then
+      return "$plan_status"
+    fi
+  fi
 
   # shellcheck disable=SC1090
   source "$snapshot_path"
@@ -2038,6 +2382,44 @@ cmd_incidents() {
   awk -F '\t' 'NF >= 2 { printf "  %s: %s\n", $1, $2 }' "$incident_path"
 }
 
+cmd_validate() {
+  [ "$#" -le 1 ] || fail_usage "validate accepts at most 1 argument"
+
+  local snapshot_name="${1:-}"
+  if [ -z "$snapshot_name" ]; then
+    snapshot_name=$(default_autosave_snapshot_name)
+  fi
+  validate_snapshot_name "$snapshot_name"
+
+  validation_errors=0
+  validation_warnings=0
+
+  printf 'Validation for %s:\n' "$snapshot_name"
+
+  local snapshot_path manifest
+  snapshot_path=$(restore_snapshot_path_for "$snapshot_name")
+  if [ -f "$snapshot_path" ]; then
+    validate_snapshot_file_structure "$snapshot_name" "$snapshot_path"
+  else
+    validation_error "snapshot not found for $snapshot_name at $snapshot_path"
+  fi
+
+  manifest=$(autosave_sessions_manifest_path_for "$snapshot_name")
+  if [ -f "$manifest" ]; then
+    validate_autosave_manifest_file "$snapshot_name" "$manifest"
+  else
+    printf 'Autosave manifest: none (%s)\n' "$manifest"
+  fi
+
+  if [ "$validation_errors" -eq 0 ]; then
+    printf 'Validation OK for %s: warnings=%s\n' "$snapshot_name" "$validation_warnings"
+    return 0
+  fi
+
+  printf 'Validation FAILED for %s: errors=%s warnings=%s\n' "$snapshot_name" "$validation_errors" "$validation_warnings"
+  return 1
+}
+
 cmd_doctor() {
   [ "$#" -le 1 ] || fail_usage "doctor accepts at most 1 argument"
 
@@ -2150,6 +2532,10 @@ main() {
     restore)
       shift
       cmd_restore "$@"
+      ;;
+    validate)
+      shift
+      cmd_validate "$@"
       ;;
     doctor)
       shift

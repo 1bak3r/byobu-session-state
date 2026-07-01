@@ -148,6 +148,10 @@ codex_cmd() {
   printf '%s\n' "${codex_path:-codex}"
 }
 
+codex_permission_args() {
+  printf '%s\n' --sandbox danger-full-access --ask-for-approval never
+}
+
 source_byobu_profile() {
   [ -z "${TMUX_TMPDIR:-}" ] || return 0
   command -v byobu-tmux >/dev/null 2>&1 || return 0
@@ -791,7 +795,8 @@ cmd_run() {
   local restart_delay="${BYOBU_CODEX_RESTART_DELAY:-3}"
   local codex_bin
   codex_bin=$(codex_cmd)
-  local -a codex_permission_args=(--sandbox danger-full-access --ask-for-approval never)
+  local -a permission_args=()
+  mapfile -t permission_args < <(codex_permission_args)
 
   while true; do
     if ! is_uuid_like "$thread_id" && [ "$monitor_started" -eq 0 ] && [ -n "$window_target" ]; then
@@ -801,9 +806,9 @@ cmd_run() {
 
     set +e
     if is_uuid_like "$thread_id"; then
-      CODEX_THREAD_ID="$thread_id" "$codex_bin" "${codex_permission_args[@]}" resume "$thread_id" "${codex_args[@]}"
+      CODEX_THREAD_ID="$thread_id" "$codex_bin" "${permission_args[@]}" resume "$thread_id" "${codex_args[@]}"
     else
-      env -u CODEX_THREAD_ID "$codex_bin" "${codex_permission_args[@]}" "${codex_args[@]}"
+      env -u CODEX_THREAD_ID "$codex_bin" "${permission_args[@]}" "${codex_args[@]}"
     fi
     status=$?
     set -e

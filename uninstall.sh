@@ -16,11 +16,13 @@ if command -v systemctl >/dev/null 2>&1 && systemctl --user show-environment >/d
 fi
 
 rm -f "$user_bin/byobu-session-state"
+rm -f "$user_bin/byobu-session-plan"
 rm -f "$user_bin/byobu"
 rm -f "$user_bin/byobu-codex"
 rm -f "$user_bin/byobu-remote"
 rm -f "$user_bin/byobu-git-sync"
 rm -f "$bin_root/byobu-session-state"
+rm -f "$bin_root/byobu-session-plan"
 rm -f "$bin_root/byobu"
 rm -f "$bin_root/byobu-codex"
 rm -f "$bin_root/byobu-remote"

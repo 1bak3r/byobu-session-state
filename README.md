@@ -37,11 +37,13 @@ This installs:
 
 ```text
 ~/.local/lib/byobu-session-state/bin/byobu-session-state
+~/.local/lib/byobu-session-state/bin/byobu-session-plan
 ~/.local/lib/byobu-session-state/bin/byobu
 ~/.local/lib/byobu-session-state/bin/byobu-codex
 ~/.local/lib/byobu-session-state/bin/byobu-remote
 ~/.local/lib/byobu-session-state/bin/byobu-git-sync
 ~/.local/bin/byobu-session-state -> ~/.local/lib/byobu-session-state/bin/byobu-session-state
+~/.local/bin/byobu-session-plan -> ~/.local/lib/byobu-session-state/bin/byobu-session-plan
 ~/.local/bin/byobu -> ~/.local/lib/byobu-session-state/bin/byobu
 ~/.local/bin/byobu-codex -> ~/.local/lib/byobu-session-state/bin/byobu-codex
 ~/.local/bin/byobu-remote -> ~/.local/lib/byobu-session-state/bin/byobu-remote
@@ -137,6 +139,10 @@ Preview the autorestore decision and autosave manifest plan:
 byobu-session-state autorestore --dry-run
 ```
 
+Dry-run restore planning is parsed by the installed Python helper
+`byobu-session-plan`, so preview commands do not need to source snapshot shell
+files.
+
 Record a watchdog heartbeat, or restore after all tmux sessions disappear when
 no capacity evidence is present:
 
@@ -178,6 +184,19 @@ Show snapshots and live sessions/windows:
 
 ```bash
 byobu-session-state status
+```
+
+Validate the default autosave snapshot, manifest, and referenced per-session
+snapshots:
+
+```bash
+byobu-session-state validate
+```
+
+Validate a named snapshot:
+
+```bash
+byobu-session-state validate work
 ```
 
 Run a full health check for installed commands, timers, lock state, autosave
@@ -247,13 +266,25 @@ byobu-codex list
 saves that metadata and, on restore, starts the tab with:
 
 ```bash
-codex resume SESSION_ID
+codex --sandbox danger-full-access --ask-for-approval never resume SESSION_ID
 ```
+
+New Codex tabs use the same permission policy. This is intentional: Byobu
+Codex tabs are treated as operator-owned long-running local agents, so they
+start with unrestricted filesystem access and no approval prompts. The launch
+policy lives in `bin/byobu-codex` in `codex_permission_args`; run `./install.sh`
+after editing it so `~/.local/lib/byobu-session-state/bin/byobu-codex` stays in
+sync with the source tree.
+
+To roll this back, remove or change `codex_permission_args`, remove
+`approval_policy = "never"` and `sandbox_mode = "danger-full-access"` from
+`~/.codex/config.toml` if those defaults are not wanted globally, then run
+`./install.sh`.
 
 The wrapper also supervises the Codex process inside the tab. If Codex exits
 with a nonzero status and the wrapper knows the session id, it restarts the tab
-with `codex resume`. If Codex exits normally, the Byobu tab remains open as a
-shell instead of disappearing.
+with the same full-permission `codex resume` command. If Codex exits normally,
+the Byobu tab remains open as a shell instead of disappearing.
 
 When restoring multiple autosaved sessions, each Codex thread id is started at
 most once by default. If duplicate tabs point at the same thread, the preferred
@@ -435,6 +466,12 @@ defaults to dry-run and only targets per-session autosave artifacts such as
 `autosave.session.NAME.snapshot`, `.last-good.snapshot`, and
 `.previous.snapshot` when they are no longer referenced by the current autosave
 manifest. It does not remove named snapshots, history, or rejected snapshots.
+
+`validate` is also read-only. It checks snapshot ownership and mode, shell
+syntax, schema version, required window and pane fields, active indexes, Codex
+thread-id shape and duplicates, manifest references, and missing current working
+directories. Missing cwd paths are warnings because restore falls back to
+`$HOME`; structural snapshot and manifest problems are errors.
 
 `--restart-processes` sends saved command lines into restored panes as keyboard
 input. Review a snapshot before using it if there is any chance it was edited or

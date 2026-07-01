@@ -1,0 +1,375 @@
+#!/usr/bin/env python3
+"""Plan byobu-session-state restores without sourcing snapshot files."""
+
+from __future__ import annotations
+
+import argparse
+import glob
+import os
+import re
+import shlex
+import subprocess
+import sys
+from dataclasses import dataclass, field
+from pathlib import Path
+
+
+ASSIGNMENT_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)(?:\[([0-9]+)\])?=(.*)$")
+WINDOW_PANE_RE = re.compile(r"^window_([0-9]+)_(pane_paths|pane_restart_commands)$")
+UUID_RE = re.compile(r"^.{8}-.{4}-.{4}-.{4}-.{12}$")
+
+
+def parse_shell_value(raw: str) -> str:
+    if raw == "":
+        return ""
+    try:
+        parts = shlex.split(raw, posix=True)
+    except ValueError as exc:
+        raise SystemExit(f"unable to parse snapshot value {raw!r}: {exc}") from exc
+    if not parts:
+        return ""
+    return parts[0]
+
+
+def parse_int(value: str | None, default: int = 0) -> int:
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        return default
+
+
+@dataclass
+class Window:
+    index: str = ""
+    name: str = ""
+    layout: str = ""
+    active_pane: str = "0"
+    pane_count: int = 1
+    pane_paths: dict[int, str] = field(default_factory=dict)
+    pane_restart_commands: dict[int, str] = field(default_factory=dict)
+    codex_thread_id: str = ""
+    codex_cwd: str = ""
+
+
+@dataclass
+class Snapshot:
+    path: Path
+    session_name: str = ""
+    active_window_position: int = 0
+    window_count: int = 0
+    windows: list[Window] = field(default_factory=list)
+
+
+def parse_snapshot(path: Path) -> Snapshot:
+    scalar: dict[str, str] = {}
+    arrays: dict[str, dict[int, str]] = {}
+
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        raise SystemExit(f"unable to read snapshot {path}: {exc}") from exc
+
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or stripped.startswith("declare "):
+            continue
+        match = ASSIGNMENT_RE.match(stripped)
+        if not match:
+            continue
+        key, index_text, raw_value = match.groups()
+        value = parse_shell_value(raw_value)
+        if index_text is None:
+            scalar[key] = value
+        else:
+            arrays.setdefault(key, {})[int(index_text)] = value
+
+    snapshot = Snapshot(
+        path=path,
+        session_name=scalar.get("session_name", ""),
+        active_window_position=parse_int(scalar.get("active_window_position"), 0),
+        window_count=parse_int(scalar.get("window_count"), 0),
+    )
+
+    windows: list[Window] = []
+    for idx in range(snapshot.window_count):
+        window = Window(
+            index=arrays.get("window_indexes", {}).get(idx, str(idx)),
+            name=arrays.get("window_names", {}).get(idx, ""),
+            layout=arrays.get("window_layouts", {}).get(idx, ""),
+            active_pane=arrays.get("window_active_panes", {}).get(idx, "0"),
+            pane_count=parse_int(arrays.get("window_pane_counts", {}).get(idx), 1),
+            codex_thread_id=arrays.get("window_codex_thread_ids", {}).get(idx, ""),
+            codex_cwd=arrays.get("window_codex_cwds", {}).get(idx, ""),
+        )
+        for key, values in arrays.items():
+            pane_match = WINDOW_PANE_RE.match(key)
+            if not pane_match:
+                continue
+            window_idx = int(pane_match.group(1))
+            pane_kind = pane_match.group(2)
+            if window_idx != idx:
+                continue
+            if pane_kind == "pane_paths":
+                window.pane_paths.update(values)
+            elif pane_kind == "pane_restart_commands":
+                window.pane_restart_commands.update(values)
+        windows.append(window)
+    snapshot.windows = windows
+    return snapshot
+
+
+def snapshot_window_count(path: Path) -> int:
+    if not path.exists():
+        return 0
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if line.startswith("window_count="):
+                return parse_int(parse_shell_value(line.split("=", 1)[1]), 0)
+    except OSError:
+        return 0
+    return 0
+
+
+def snapshot_codex_count(path: Path) -> int:
+    if not path.exists():
+        return 0
+    try:
+        return sum(1 for line in path.read_text(encoding="utf-8").splitlines() if re.match(r"^window_codex_thread_ids\[[0-9]+\]=", line))
+    except OSError:
+        return 0
+
+
+def snapshot_named_window_count(path: Path) -> int:
+    if not path.exists():
+        return 0
+    count = 0
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            match = re.match(r"^window_names\[[0-9]+\]=(.*)$", line)
+            if not match:
+                continue
+            value = parse_shell_value(match.group(1))
+            if value and value != "-":
+                count += 1
+    except OSError:
+        return 0
+    return count
+
+
+def snapshot_score(path: Path) -> int:
+    return snapshot_window_count(path) * 1000 + snapshot_codex_count(path) * 100 + snapshot_named_window_count(path)
+
+
+def snapshot_quality_summary(path: Path) -> str:
+    return (
+        f"windows={snapshot_window_count(path)} "
+        f"codex={snapshot_codex_count(path)} "
+        f"named={snapshot_named_window_count(path)} "
+        f"score={snapshot_score(path)}"
+    )
+
+
+def restore_snapshot_path(snapshot_root: Path, snapshot_name: str) -> Path:
+    current = snapshot_root / f"{snapshot_name}.snapshot"
+    last_good = snapshot_root / f"{snapshot_name}.last-good.snapshot"
+    if last_good.exists() and current.exists() and snapshot_score(last_good) > snapshot_score(current):
+        return last_good
+    if current.exists():
+        return current
+    if last_good.exists():
+        return last_good
+    return current
+
+
+def tmux_has_session(target_session: str) -> str:
+    if not target_session:
+        return "unknown"
+    try:
+        result = subprocess.run(
+            ["tmux", "has-session", "-t", target_session],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+    except OSError:
+        return "unknown"
+    return "yes" if result.returncode == 0 else "no"
+
+
+def is_uuid_like(value: str) -> bool:
+    return bool(UUID_RE.match(value))
+
+
+def print_restore_plan(args: argparse.Namespace) -> int:
+    snapshot_path = Path(args.snapshot_path) if args.snapshot_path else restore_snapshot_path(Path(args.snapshot_root), args.snapshot_name)
+    if not snapshot_path.exists():
+        print(f"snapshot not found: {snapshot_path}", file=sys.stderr)
+        return 1
+
+    snapshot = parse_snapshot(snapshot_path)
+    target_session = args.target_session or snapshot.session_name
+    target_exists = tmux_has_session(target_session) if args.check_target else args.target_exists
+
+    print("Restore plan:")
+    print(f"  snapshot: {snapshot_path}")
+    print(f"  target_session: {target_session}")
+    print(f"  target_exists: {target_exists}")
+    print(f"  restart_processes: {args.restart_processes}")
+    print(f"  restart_codex: {args.restart_codex}")
+    print(f"  window_count: {snapshot.window_count}")
+    print(f"  active_window_position: {snapshot.active_window_position}")
+
+    for idx, window in enumerate(snapshot.windows):
+        first_path = window.pane_paths.get(0, os.environ.get("HOME", ""))
+        active_pane = window.active_pane
+        print(
+            f"  window[{idx}]: name={window.name} panes={window.pane_count} "
+            f"cwd={first_path} active_pane={active_pane}",
+            end="",
+        )
+        if is_uuid_like(window.codex_thread_id):
+            codex_cwd = window.codex_cwd or first_path
+            print(f" codex_thread_id={window.codex_thread_id} codex_cwd={codex_cwd}", end="")
+        if args.restart_processes == "1":
+            restart_count = sum(1 for value in window.pane_restart_commands.values() if value)
+            print(f" restart_commands={restart_count}", end="")
+        print()
+    return 0
+
+
+def manifest_path(snapshot_root: Path, snapshot_name: str) -> Path:
+    return snapshot_root / f"{snapshot_name}.sessions.tsv"
+
+
+def read_manifest(path: Path) -> tuple[str, list[tuple[str, str]]]:
+    primary = ""
+    sessions: list[tuple[str, str]] = []
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        raise SystemExit(f"unable to read manifest {path}: {exc}") from exc
+    for line in lines:
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split("\t")
+        if parts[0] == "primary" and len(parts) >= 2:
+            primary = parts[1]
+        elif parts[0] == "snapshot" and len(parts) >= 3:
+            sessions.append((parts[1], parts[2]))
+    return primary, sessions
+
+
+def print_autosave_plan(args: argparse.Namespace) -> int:
+    snapshot_root = Path(args.snapshot_root)
+    snapshot_name = args.snapshot_name
+    manifest = manifest_path(snapshot_root, snapshot_name)
+
+    print(f"Autosave restore plan for {snapshot_name}:")
+    if manifest.exists():
+        print(f"  manifest: {manifest}")
+        primary, sessions = read_manifest(manifest)
+        print(f"  primary: {primary if primary else 'unknown'}")
+        if not sessions:
+            print("  sessions: none")
+            return 0
+        for session, per_snapshot in sessions:
+            path = restore_snapshot_path(snapshot_root, per_snapshot)
+            if path.exists():
+                status = f"present {snapshot_quality_summary(path)}"
+            else:
+                status = "missing"
+            primary_text = "yes" if session == primary else "no"
+            print(
+                f"  session: {session} snapshot={per_snapshot} primary={primary_text} "
+                f"status={status} path={path}"
+            )
+        return 0
+
+    print(f"  manifest: missing ({manifest})")
+    path = restore_snapshot_path(snapshot_root, snapshot_name)
+    if path.exists():
+        print(f"  fallback: snapshot={snapshot_name} status=present {snapshot_quality_summary(path)} path={path}")
+    else:
+        print(f"  fallback: snapshot={snapshot_name} status=missing path={path}")
+    return 0
+
+
+def autosave_session_snapshot_bases(snapshot_root: Path, snapshot_name: str) -> list[str]:
+    bases: set[str] = set()
+    pattern = str(snapshot_root / f"{snapshot_name}.session.*.snapshot")
+    for path_text in glob.glob(pattern):
+        name = Path(path_text).name
+        for suffix in (".last-good.snapshot", ".previous.snapshot", ".snapshot"):
+            if name.endswith(suffix):
+                bases.add(name[: -len(suffix)])
+                break
+    return sorted(bases)
+
+
+def manifest_references(manifest: Path, wanted_snapshot: str) -> bool:
+    if not manifest.exists():
+        return False
+    _, sessions = read_manifest(manifest)
+    return any(per_snapshot == wanted_snapshot for _, per_snapshot in sessions)
+
+
+def autosave_session_snapshot_paths(snapshot_root: Path, base: str) -> list[Path]:
+    return [
+        snapshot_root / f"{base}.snapshot",
+        snapshot_root / f"{base}.last-good.snapshot",
+        snapshot_root / f"{base}.previous.snapshot",
+    ]
+
+
+def print_unreferenced(args: argparse.Namespace) -> int:
+    snapshot_root = Path(args.snapshot_root)
+    snapshot_name = args.snapshot_name
+    manifest = manifest_path(snapshot_root, snapshot_name)
+    print(f"Unreferenced autosave session snapshots for {snapshot_name}:")
+    found = False
+    for base in autosave_session_snapshot_bases(snapshot_root, snapshot_name):
+        if manifest_references(manifest, base):
+            continue
+        found = True
+        print(f"  {base}")
+        for path in autosave_session_snapshot_paths(snapshot_root, base):
+            if path.exists():
+                print(f"    {path}")
+    if not found:
+        print("  none")
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    subparsers = parser.add_subparsers(dest="cmd", required=True)
+
+    restore = subparsers.add_parser("restore")
+    restore.add_argument("--snapshot-root", required=True)
+    restore.add_argument("--snapshot-name", required=True)
+    restore.add_argument("--snapshot-path", default="")
+    restore.add_argument("--target-session", default="")
+    restore.add_argument("--target-exists", default="unknown")
+    restore.add_argument("--check-target", action="store_true")
+    restore.add_argument("--restart-processes", choices=("0", "1"), required=True)
+    restore.add_argument("--restart-codex", choices=("0", "1"), required=True)
+    restore.set_defaults(func=print_restore_plan)
+
+    autosave = subparsers.add_parser("autosave")
+    autosave.add_argument("--snapshot-root", required=True)
+    autosave.add_argument("--snapshot-name", required=True)
+    autosave.set_defaults(func=print_autosave_plan)
+
+    unreferenced = subparsers.add_parser("unreferenced")
+    unreferenced.add_argument("--snapshot-root", required=True)
+    unreferenced.add_argument("--snapshot-name", required=True)
+    unreferenced.set_defaults(func=print_unreferenced)
+
+    args = parser.parse_args()
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

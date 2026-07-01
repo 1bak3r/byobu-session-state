@@ -11,6 +11,7 @@ uninstall:
 
 lint:
 	@bash -n bin/byobu-session-state
+	@python3 -c 'from pathlib import Path; compile(Path("bin/byobu-session-plan").read_text(encoding="utf-8"), "bin/byobu-session-plan", "exec")'
 	@bash -n bin/byobu
 	@bash -n bin/byobu-codex
 	@bash -n bin/byobu-remote
@@ -20,11 +21,13 @@ lint:
 	@bash -n tests/dynamic-tabs.sh
 	@bash -n tests/autosave-guard.sh
 	@bash -n tests/doctor-prune.sh
+	@bash -n tests/validate-crash.sh
 	@bash -n tests/watchdog.sh
 	@bash -n install.sh
 	@bash -n uninstall.sh
 	@bash -n tests/cli.sh
 	@bash -n tests/codex.sh
+	@bash -n tests/installed-codex.sh
 	@bash -n tests/git-sync.sh
 	@bash -n tests/smoke.sh
 
@@ -32,10 +35,12 @@ test: lint
 	@./tests/cli.sh
 	@./tests/autosave-guard.sh
 	@./tests/doctor-prune.sh
+	@./tests/validate-crash.sh
 	@./tests/watchdog.sh
 	@./tests/byobu-wrapper.sh
 	@./tests/byobu-remote.sh
 	@./tests/dynamic-tabs.sh
 	@./tests/codex.sh
+	@./tests/installed-codex.sh
 	@./tests/git-sync.sh
 	@./tests/smoke.sh

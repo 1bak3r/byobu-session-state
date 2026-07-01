@@ -34,6 +34,15 @@ if tmux has-session -t "$restore_session" 2>/dev/null; then
   exit 1
 fi
 
+BYOBU_SESSION_STATE_DIR="$snapshot_dir" "$repo_root/bin/byobu-session-plan" restore \
+  --snapshot-root "$snapshot_dir" \
+  --snapshot-name plan \
+  --restart-processes 0 \
+  --restart-codex 0 \
+  --check-target > "$out"
+grep -q '^Restore plan:$' "$out"
+grep -q "target_session: $session_name" "$out"
+
 cat > "$snapshot_dir/autosave.sessions.tsv" <<EOF
 # byobu-session-state autosave sessions v1
 primary	referenced
@@ -59,6 +68,10 @@ run_cli doctor autosave > "$out"
 grep -q '^Autosave restore plan for autosave:$' "$out"
 grep -q '^Unreferenced autosave session snapshots for autosave:$' "$out"
 grep -q 'autosave.session.stale' "$out"
+
+"$repo_root/bin/byobu-session-plan" autosave --snapshot-root "$snapshot_dir" --snapshot-name autosave > "$out"
+grep -q '^Autosave restore plan for autosave:$' "$out"
+grep -q 'session: referenced snapshot=autosave.session.referenced primary=yes status=present' "$out"
 
 run_cli prune autosave > "$out"
 grep -q "Would delete $snapshot_dir/autosave.session.stale.snapshot" "$out"
