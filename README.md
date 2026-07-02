@@ -67,6 +67,11 @@ before handing off to the real Byobu binary. That makes a normal `byobu` launch
 after a computer restart reopen the saved windows instead of creating an empty
 session first.
 
+The wrapper also installs tmux hooks for Byobu tab and session exits. When a tab
+is closed, the hook runs `byobu-session-state hook-autosave autosave` so the
+saved autosave snapshot shrinks to match the live session instead of restoring a
+tab you intentionally exited.
+
 When user systemd is available, the installer enables:
 - a one-minute autosave timer
 - a one-minute watchdog timer that diagnoses disappeared tmux sessions and
@@ -283,8 +288,10 @@ To roll this back, remove or change `codex_permission_args`, remove
 
 The wrapper also supervises the Codex process inside the tab. If Codex exits
 with a nonzero status and the wrapper knows the session id, it restarts the tab
-with the same full-permission `codex resume` command. If Codex exits normally,
-the Byobu tab remains open as a shell instead of disappearing.
+with the same full-permission `codex resume` command. When Codex exits without
+being restarted, the Byobu tab closes so one `exit` closes the tab. Set
+`BYOBU_CODEX_KEEP_SHELL_ON_EXIT=1` to keep the old behavior of dropping into a
+shell after Codex exits.
 
 When restoring multiple autosaved sessions, each Codex thread id is started at
 most once by default. If duplicate tabs point at the same thread, the preferred

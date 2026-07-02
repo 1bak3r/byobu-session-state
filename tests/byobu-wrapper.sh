@@ -111,4 +111,57 @@ if grep -q '^args:' "$byobu_log"; then
   exit 1
 fi
 
+env TMUX_TMPDIR="$tmux_tmp" tmux kill-session -t "$rich_session"
+env TMUX_TMPDIR="$tmux_tmp" tmux kill-session -t "$small_session"
+
+hook_session="byobu-wrapper-hook-$$"
+: > "$byobu_log"
+env TMUX_TMPDIR="$tmux_tmp" tmux new-session -d -s "$hook_session" -n keep -c "$tmp_dir"
+env TMUX_TMPDIR="$tmux_tmp" tmux new-window -t "$hook_session:" -n close-me -c /tmp
+
+env \
+  PATH="$fake_bin:$repo_root/bin:$PATH" \
+  TMUX_TMPDIR="$tmux_tmp" \
+  BYOBU_SESSION_STATE_DIR="$snapshot_dir" \
+  "$repo_root/bin/byobu-session-state" autosave autosave "$hook_session" >/dev/null
+
+grep -q '^window_count=2$' "$snapshot_dir/autosave.snapshot" || {
+  echo "pre-hook autosave did not capture both wrapper hook test windows" >&2
+  exit 1
+}
+
+env \
+  PATH="$fake_bin:$repo_root/bin:$PATH" \
+  TMUX_TMPDIR="$tmux_tmp" \
+  BYOBU_SESSION_FORCE_ATTACH=1 \
+  BYOBU_SESSION_STATE_DIR="$snapshot_dir" \
+  BYOBU_REAL_BIN="$fake_byobu" \
+  "$repo_root/bin/byobu"
+
+env TMUX_TMPDIR="$tmux_tmp" tmux show-hooks -g window-unlinked | grep -q 'hook-autosave autosave' || {
+  echo "byobu wrapper did not install the window-unlinked autosave hook" >&2
+  env TMUX_TMPDIR="$tmux_tmp" tmux show-hooks -g window-unlinked >&2 || true
+  exit 1
+}
+
+env TMUX_TMPDIR="$tmux_tmp" tmux kill-window -t "$hook_session:close-me"
+for _ in $(seq 1 50); do
+  if grep -q '^window_count=1$' "$snapshot_dir/autosave.snapshot" \
+    && ! grep -q 'close-me' "$snapshot_dir/autosave.snapshot"; then
+    break
+  fi
+  sleep 0.1
+done
+
+if ! grep -q '^window_count=1$' "$snapshot_dir/autosave.snapshot"; then
+  echo "byobu wrapper hook did not autosave after closing a tab" >&2
+  cat "$snapshot_dir/autosave.snapshot" >&2
+  exit 1
+fi
+if grep -q 'close-me' "$snapshot_dir/autosave.snapshot"; then
+  echo "closed tab remained in autosave snapshot after wrapper hook ran" >&2
+  cat "$snapshot_dir/autosave.snapshot" >&2
+  exit 1
+fi
+
 echo "byobu wrapper test passed"

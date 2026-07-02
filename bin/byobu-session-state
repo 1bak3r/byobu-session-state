@@ -14,6 +14,7 @@ usage() {
 Usage:
   byobu-session-state save [snapshot_name] [session_name]
   byobu-session-state autosave [snapshot_name] [session_name]
+  byobu-session-state hook-autosave [snapshot_name]
   byobu-session-state autorestore [--dry-run] [--restart-codex|--no-restart-codex] [--restart-processes] [snapshot_name] [target_session]
   byobu-session-state watchdog [--restart-codex|--no-restart-codex] [--restart-processes] [--no-restore] [snapshot_name]
   byobu-session-state restore [--dry-run] [--restart-codex|--no-restart-codex] [--restart-processes] <snapshot_name> [target_session]
@@ -30,6 +31,7 @@ Examples:
   byobu-session-state save work
   byobu-session-state save work mysession
   byobu-session-state autosave
+  byobu-session-state hook-autosave
   byobu-session-state restore work
   byobu-session-state autorestore
   byobu-session-state restore --no-restart-codex work
@@ -244,7 +246,7 @@ release_state_lock() {
 
 requires_state_lock() {
   case "${1:-}" in
-    save|autosave|auto-save|autorestore|auto-restore|watchdog|watch|restore|prune)
+    save|autosave|auto-save|hook-autosave|autorestore|auto-restore|watchdog|watch|restore|prune)
       return 0
       ;;
     *)
@@ -1620,6 +1622,20 @@ cmd_autosave() {
   fi
 }
 
+cmd_hook_autosave() {
+  [ "$#" -le 1 ] || fail_usage "hook-autosave accepts at most 1 argument"
+
+  local snapshot_name="${1:-}"
+  if [ -z "$snapshot_name" ]; then
+    snapshot_name=$(default_autosave_snapshot_name)
+  fi
+  validate_snapshot_name "$snapshot_name"
+
+  BYOBU_SESSION_ALLOW_DEGRADED_AUTOSAVE=1 \
+    BYOBU_SESSION_SKIP_CODEX_ADOPT=1 \
+    cmd_autosave "$snapshot_name"
+}
+
 cmd_watchdog() {
   ensure_tmux
   ensure_snapshot_root
@@ -2520,6 +2536,10 @@ main() {
     autosave|auto-save)
       shift
       cmd_autosave "$@"
+      ;;
+    hook-autosave)
+      shift
+      cmd_hook_autosave "$@"
       ;;
     autorestore|auto-restore)
       shift

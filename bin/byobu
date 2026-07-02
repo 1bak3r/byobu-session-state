@@ -14,17 +14,36 @@ truthy() {
   esac
 }
 
-state_cmd() {
+shell_join() {
+  local out="" arg quoted
+  for arg in "$@"; do
+    if [ -z "$out" ]; then
+      printf -v out '%q' "$arg"
+    else
+      printf -v quoted '%q' "$arg"
+      out="$out $quoted"
+    fi
+  done
+  printf '%s\n' "$out"
+}
+
+state_cmd_path() {
   local script_dir
   script_dir=$(cd "$(dirname "$0")" && pwd -P)
 
   if command -v byobu-session-state >/dev/null 2>&1; then
-    byobu-session-state "$@"
+    command -v byobu-session-state
   elif [ -x "$script_dir/byobu-session-state" ]; then
-    "$script_dir/byobu-session-state" "$@"
+    printf '%s\n' "$script_dir/byobu-session-state"
   else
-    "$HOME/.local/bin/byobu-session-state" "$@"
+    printf '%s\n' "$HOME/.local/bin/byobu-session-state"
   fi
+}
+
+state_cmd() {
+  local cmd
+  cmd=$(state_cmd_path)
+  "$cmd" "$@"
 }
 
 real_byobu_bin() {
@@ -58,6 +77,35 @@ session_codex_thread_count() {
     | awk 'NF { count++ } END { print count + 0 }'
 }
 
+tmux_has_sessions() {
+  tmux list-sessions >/dev/null 2>&1
+}
+
+install_tmux_exit_autosave_hooks() {
+  truthy "${BYOBU_SESSION_SKIP_EXIT_HOOKS:-0}" && return 0
+  command -v tmux >/dev/null 2>&1 || return 0
+
+  local state_path hook_cmd hook_body tmux_bin
+  state_path=$(state_cmd_path) || return 0
+  [ -x "$state_path" ] || return 0
+
+  local -a cmd=(env BYOBU_SESSION_SKIP_CODEX_ADOPT=1)
+  if [ -n "${TMUX_TMPDIR:-}" ]; then
+    cmd+=(TMUX_TMPDIR="$TMUX_TMPDIR")
+  fi
+  if [ -n "${BYOBU_SESSION_STATE_DIR:-}" ]; then
+    cmd+=(BYOBU_SESSION_STATE_DIR="$BYOBU_SESSION_STATE_DIR")
+  fi
+  cmd+=("$state_path" hook-autosave "$snapshot_name")
+
+  hook_cmd=$(shell_join "${cmd[@]}")
+  hook_body="run-shell -b \"$hook_cmd >/dev/null 2>&1 || true\""
+  tmux_bin=$(byobu_tmux_cmd)
+
+  "$tmux_bin" set-hook -g 'window-unlinked[90]' "$hook_body" >/dev/null 2>&1 || true
+  "$tmux_bin" set-hook -g 'session-closed[90]' "$hook_body" >/dev/null 2>&1 || true
+}
+
 best_live_session_name() {
   command -v tmux >/dev/null 2>&1 || return 1
 
@@ -80,6 +128,13 @@ attach_best_session_if_plain_launch() {
 
   local session tmux_bin
   session=$(best_live_session_name || true)
+  if [ -z "$session" ]; then
+    local new_session="${BYOBU_SESSION_DEFAULT_NAME:-byobu}"
+    tmux_bin=$(byobu_tmux_cmd)
+    "$tmux_bin" new-session -d -s "$new_session" >/dev/null 2>&1 || return 1
+    install_tmux_exit_autosave_hooks
+    session="$new_session"
+  fi
   [ -n "$session" ] || return 1
 
   tmux_bin=$(byobu_tmux_cmd)
@@ -89,6 +144,8 @@ attach_best_session_if_plain_launch() {
 if ! truthy "${BYOBU_SESSION_SKIP_AUTORESTORE:-0}"; then
   state_cmd autorestore --restart-codex "$snapshot_name" >/dev/null || true
 fi
+
+install_tmux_exit_autosave_hooks
 
 if attach_best_session_if_plain_launch "$@"; then
   exit 0

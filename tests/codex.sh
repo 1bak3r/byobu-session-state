@@ -14,6 +14,7 @@ stale_thread_id="019f9999-0000-7000-8000-000000000099"
 fake_codex="$tmp_dir/fake-codex"
 crashy_codex="$tmp_dir/crashy-codex"
 plain_codex="$tmp_dir/codex"
+exit_codex="$tmp_dir/exit-codex"
 codex_home="$tmp_dir/codex-home"
 codex_log="$tmp_dir/codex.log"
 crashy_log="$tmp_dir/crashy.log"
@@ -60,6 +61,12 @@ cat > "$plain_codex" <<'EOF'
 sleep 900
 EOF
 chmod +x "$plain_codex"
+
+cat > "$exit_codex" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+chmod +x "$exit_codex"
 
 tmux kill-session -t "$session_name" >/dev/null 2>&1 || true
 tmux kill-session -t "$restored_session" >/dev/null 2>&1 || true
@@ -124,6 +131,40 @@ crash_resume_count=$(grep -Fxc -- "--sandbox danger-full-access --ask-for-approv
 
 tmux set-environment -t "$session_name" BYOBU_CODEX_BIN "$fake_codex"
 tmux set-environment -t "$session_name" BYOBU_CODEX_RESTART_DELAY "3"
+
+tmux set-environment -t "$session_name" BYOBU_CODEX_BIN "$exit_codex"
+env \
+  PATH="$repo_root/bin:$PATH" \
+  CODEX_HOME="$codex_home" \
+  BYOBU_SESSION_STATE_DIR="$snapshot_dir" \
+  "$repo_root/bin/byobu-codex" add --session "$session_name" --name "Exit Once" --cd "$tmp_dir" -- "done"
+
+for _ in $(seq 1 50); do
+  if ! tmux list-windows -t "$session_name" -F '#{window_name}' | grep -Fxq "Exit Once"; then
+    break
+  fi
+  sleep 0.1
+done
+if tmux list-windows -t "$session_name" -F '#{window_name}' | grep -Fxq "Exit Once"; then
+  echo "Codex tab stayed open after normal Codex exit" >&2
+  exit 1
+fi
+
+tmux set-environment -t "$session_name" BYOBU_CODEX_KEEP_SHELL_ON_EXIT "1"
+env \
+  PATH="$repo_root/bin:$PATH" \
+  CODEX_HOME="$codex_home" \
+  BYOBU_SESSION_STATE_DIR="$snapshot_dir" \
+  "$repo_root/bin/byobu-codex" add --session "$session_name" --name "Keep Shell" --cd "$tmp_dir" -- "done"
+
+sleep 0.5
+tmux list-windows -t "$session_name" -F '#{window_name}' | grep -Fxq "Keep Shell" || {
+  echo "Codex tab did not honor BYOBU_CODEX_KEEP_SHELL_ON_EXIT" >&2
+  exit 1
+}
+tmux kill-window -t "$session_name:Keep Shell"
+tmux set-environment -t "$session_name" BYOBU_CODEX_KEEP_SHELL_ON_EXIT "0"
+tmux set-environment -t "$session_name" BYOBU_CODEX_BIN "$fake_codex"
 
 env \
   CODEX_HOME="$codex_home" \
