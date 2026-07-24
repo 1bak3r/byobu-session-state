@@ -4,6 +4,66 @@ set -euo pipefail
 snapshot_name="${BYOBU_REMOTE_SNAPSHOT:-${BYOBU_SESSION_AUTOSAVE_NAME:-autosave}}"
 remote_session="${BYOBU_REMOTE_SESSION:-}"
 
+if [ -z "${BYOBU_SESSION_TMUX_SOCKET:-}" ]; then
+  if [ -n "${BYOBU_REMOTE_SOCKET:-}" ]; then
+    export BYOBU_SESSION_TMUX_SOCKET="$BYOBU_REMOTE_SOCKET"
+  elif [ -n "${BYOBU_KEEPALIVE_SOCKET:-}" ]; then
+    export BYOBU_SESSION_TMUX_SOCKET="$BYOBU_KEEPALIVE_SOCKET"
+  fi
+fi
+
+tmux_socket_label() {
+  local label="${BYOBU_SESSION_TMUX_SOCKET:-}"
+  [ -n "$label" ] || return 1
+  case "$label" in
+    *[!A-Za-z0-9_.-]*|.*|*/*)
+      printf 'invalid BYOBU_SESSION_TMUX_SOCKET label: %s\n' "$label" >&2
+      return 2
+      ;;
+  esac
+  printf '%s\n' "$label"
+}
+
+tmux_socket_enabled() {
+  [ -n "${BYOBU_SESSION_TMUX_SOCKET:-}" ]
+}
+
+tmux_available() {
+  type -P tmux >/dev/null 2>&1
+}
+
+tmux() {
+  local label status
+  if label=$(tmux_socket_label); then
+    command tmux -L "$label" "$@"
+  else
+    status=$?
+    case "$status" in
+      1)
+        command tmux "$@"
+        ;;
+      *)
+        return "$status"
+        ;;
+    esac
+  fi
+}
+
+exec_tmux() {
+  local label status
+  if label=$(tmux_socket_label); then
+    exec tmux -L "$label" "$@"
+  else
+    status=$?
+    [ "$status" -eq 1 ] || return "$status"
+    exec tmux "$@"
+  fi
+}
+
+validate_tmux_socket_config() {
+  [ -z "${BYOBU_SESSION_TMUX_SOCKET:-}" ] || tmux_socket_label >/dev/null
+}
+
 usage() {
   cat >&2 <<'EOF'
 Usage:
@@ -39,6 +99,11 @@ tailscale_address() {
 }
 
 tmux_cmd() {
+  if tmux_socket_enabled; then
+    printf '%s\n' "tmux"
+    return 0
+  fi
+
   if command -v byobu-tmux >/dev/null 2>&1; then
     printf '%s\n' "byobu-tmux"
   else
@@ -53,7 +118,7 @@ session_codex_thread_count() {
 }
 
 best_live_session_name() {
-  command -v tmux >/dev/null 2>&1 || return 1
+  tmux_available || return 1
 
   local session windows attached activity codex
   {
@@ -90,9 +155,15 @@ attach() {
   fi
 
   if [ -n "$session" ]; then
+    if tmux_socket_enabled && [ "$tmux_bin" = "tmux" ]; then
+      exec_tmux attach-session -t "$session"
+    fi
     exec "$tmux_bin" attach-session -t "$session"
   fi
 
+  if tmux_socket_enabled && [ "$tmux_bin" = "tmux" ]; then
+    exec_tmux new-session -s byobu
+  fi
   exec "$tmux_bin" new-session -s byobu
 }
 
@@ -102,8 +173,13 @@ status() {
   if [ -n "$addr" ]; then
     printf 'Tailscale IPv4: %s\n' "$addr"
   fi
+  if tmux_socket_enabled; then
+    printf 'tmux socket: %s\n' "$BYOBU_SESSION_TMUX_SOCKET"
+  fi
   state_cmd status
 }
+
+validate_tmux_socket_config
 
 cmd="${1:-attach}"
 case "$cmd" in

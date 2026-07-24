@@ -6,12 +6,15 @@ snapshot_dir=$(mktemp -d)
 tmux_tmp="$snapshot_dir/tmux"
 session_name="byobu-state-cli-$$"
 restore_session="byobu-state-cli-restored-$$"
+socket_label="byobu-state-cli-socket-$$"
+socket_session="byobu-state-cli-named-$$"
 
 unset TMUX TMUX_PANE
 mkdir -p "$tmux_tmp"
 export TMUX_TMPDIR="$tmux_tmp"
 
 cleanup() {
+  tmux -L "$socket_label" kill-server >/dev/null 2>&1 || true
   tmux kill-server >/dev/null 2>&1 || true
   rm -rf "$snapshot_dir"
 }
@@ -57,6 +60,30 @@ run_cli autosave cli-auto "$session_name" >/tmp/byobu-state-cli.out
 
 run_cli status >/tmp/byobu-state-cli.out
 grep -q 'Snapshot directory:' /tmp/byobu-state-cli.out
+
+if BYOBU_SESSION_TMUX_SOCKET=../../bad run_cli status >/tmp/byobu-state-cli.out 2>/tmp/byobu-state-cli.err; then
+  echo "expected invalid tmux socket label to fail" >&2
+  exit 1
+fi
+grep -q 'invalid BYOBU_SESSION_TMUX_SOCKET label' /tmp/byobu-state-cli.err
+
+tmux -L "$socket_label" new-session -d -s "$socket_session" -n named -c /tmp
+if tmux has-session -t "$socket_session" 2>/dev/null; then
+  echo "named-socket session unexpectedly exists on the default tmux socket" >&2
+  exit 1
+fi
+tmux -L "$socket_label" has-session -t "$socket_session"
+BYOBU_SESSION_TMUX_SOCKET="$socket_label" run_cli save cli-socket "$socket_session" >/tmp/byobu-state-cli.out
+grep -q '^session_name=byobu-state-cli-named-' "$snapshot_dir/cli-socket.snapshot" || {
+  echo "named-socket save did not capture the expected session" >&2
+  exit 1
+}
+BYOBU_SESSION_TMUX_SOCKET="$socket_label" run_cli status >/tmp/byobu-state-cli.out
+grep -q "$socket_session" /tmp/byobu-state-cli.out || {
+  echo "named-socket status did not include the named session" >&2
+  cat /tmp/byobu-state-cli.out >&2
+  exit 1
+}
 
 lock_dir="$snapshot_dir/.state.lock"
 lock_marker="$snapshot_dir/lock-held"

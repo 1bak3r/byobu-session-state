@@ -13,6 +13,43 @@ target_remote_url="${BYOBU_GIT_SYNC_TARGET_REMOTE_URL:-https://github.com/1bak3r
 target_branch="${BYOBU_GIT_SYNC_TARGET_BRANCH:-main}"
 dry_run=0
 
+tmux_socket_label() {
+  local label="${BYOBU_SESSION_TMUX_SOCKET:-}"
+  [ -n "$label" ] || return 1
+  case "$label" in
+    *[!A-Za-z0-9_.-]*|.*|*/*)
+      printf 'invalid BYOBU_SESSION_TMUX_SOCKET label: %s\n' "$label" >&2
+      return 2
+      ;;
+  esac
+  printf '%s\n' "$label"
+}
+
+tmux_available() {
+  type -P tmux >/dev/null 2>&1
+}
+
+tmux() {
+  local label status
+  if label=$(tmux_socket_label); then
+    command tmux -L "$label" "$@"
+  else
+    status=$?
+    case "$status" in
+      1)
+        command tmux "$@"
+        ;;
+      *)
+        return "$status"
+        ;;
+    esac
+  fi
+}
+
+validate_tmux_socket_config() {
+  [ -z "${BYOBU_SESSION_TMUX_SOCKET:-}" ] || tmux_socket_label >/dev/null
+}
+
 usage() {
   cat >&2 <<'EOF'
 Usage:
@@ -82,7 +119,7 @@ run_git() {
 }
 
 tmux_pane_paths() {
-  command -v tmux >/dev/null 2>&1 || return 0
+  tmux_available || return 0
 
   if [ -n "$tmux_target" ]; then
     tmux list-panes -t "$tmux_target" -F '#{pane_current_path}' 2>/dev/null || true
@@ -92,12 +129,12 @@ tmux_pane_paths() {
 }
 
 tmux_sessions() {
-  command -v tmux >/dev/null 2>&1 || return 0
+  tmux_available || return 0
   tmux list-sessions -F '#{session_name}' 2>/dev/null || true
 }
 
 tmux_live_panes() {
-  command -v tmux >/dev/null 2>&1 || return 0
+  tmux_available || return 0
 
   if [ -n "$tmux_target" ]; then
     tmux list-panes -t "$tmux_target" -F '#{session_name}	#{window_index}	#{window_name}	#{pane_index}	#{pane_current_path}	#{pane_current_command}' 2>/dev/null || true
@@ -708,6 +745,8 @@ case "$cmd" in
     exit 0
     ;;
 esac
+
+validate_tmux_socket_config
 
 parse_args "$@"
 

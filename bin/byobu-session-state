@@ -9,6 +9,47 @@ restore_codex_preferred_session=""
 restore_codex_resumed_threads=""
 restore_codex_suppressed_threads=""
 
+tmux_socket_label() {
+  local label="${BYOBU_SESSION_TMUX_SOCKET:-}"
+  [ -n "$label" ] || return 1
+  case "$label" in
+    *[!A-Za-z0-9_.-]*|.*|*/*)
+      printf 'invalid BYOBU_SESSION_TMUX_SOCKET label: %s\n' "$label" >&2
+      return 2
+      ;;
+  esac
+  printf '%s\n' "$label"
+}
+
+tmux_socket_enabled() {
+  [ -n "${BYOBU_SESSION_TMUX_SOCKET:-}" ]
+}
+
+tmux_available() {
+  type -P tmux >/dev/null 2>&1
+}
+
+tmux() {
+  local label status
+  if label=$(tmux_socket_label); then
+    command tmux -L "$label" "$@"
+  else
+    status=$?
+    case "$status" in
+      1)
+        command tmux "$@"
+        ;;
+      *)
+        return "$status"
+        ;;
+    esac
+  fi
+}
+
+validate_tmux_socket_config() {
+  [ -z "${BYOBU_SESSION_TMUX_SOCKET:-}" ] || tmux_socket_label >/dev/null
+}
+
 usage() {
   cat >&2 <<'EOF'
 Usage:
@@ -87,7 +128,7 @@ fail_usage() {
 }
 
 ensure_tmux() {
-  command -v tmux >/dev/null 2>&1 || fail "tmux is required."
+  tmux_available || fail "tmux is required."
 }
 
 validate_snapshot_name() {
@@ -116,6 +157,11 @@ byobu_tmux_cmd() {
     return 0
   fi
 
+  if tmux_socket_enabled; then
+    printf '%s\n' "tmux"
+    return 0
+  fi
+
   if command -v byobu-tmux >/dev/null 2>&1; then
     printf '%s\n' "byobu-tmux"
   else
@@ -125,6 +171,15 @@ byobu_tmux_cmd() {
 
 source_byobu_profile() {
   [ -z "${TMUX_TMPDIR:-}" ] || return 0
+  if tmux_socket_enabled; then
+    local profile
+    for profile in /usr/share/byobu/profiles/tmux /usr/share/byobu/profiles/tmuxrc; do
+      [ -r "$profile" ] || continue
+      tmux source-file "$profile" >/dev/null 2>&1 || true
+    done
+    return 0
+  fi
+
   command -v byobu-tmux >/dev/null 2>&1 || return 0
   local profile
   for profile in /usr/share/byobu/profiles/tmux /usr/share/byobu/profiles/tmuxrc; do
@@ -703,7 +758,7 @@ print_command_summary() {
   local cmd path
   printf 'Commands:\n'
   for cmd in tmux byobu byobu-tmux byobu-session-state byobu-codex byobu-remote byobu-git-sync; do
-    path=$(command -v "$cmd" 2>/dev/null || true)
+    path=$(type -P "$cmd" 2>/dev/null || command -v "$cmd" 2>/dev/null || true)
     if [ -n "$path" ]; then
       printf '  %s: %s\n' "$cmd" "$path"
     else
@@ -766,7 +821,7 @@ print_watchdog_summary() {
 
 print_live_sessions_summary() {
   printf 'Live tmux/byobu sessions:\n'
-  command -v tmux >/dev/null 2>&1 || {
+  tmux_available || {
     printf '  tmux missing\n'
     return 0
   }
@@ -2588,5 +2643,7 @@ main() {
       ;;
   esac
 }
+
+validate_tmux_socket_config
 
 main "$@"

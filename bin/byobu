@@ -3,6 +3,58 @@ set -euo pipefail
 
 snapshot_name="${BYOBU_SESSION_AUTOSAVE_NAME:-autosave}"
 
+tmux_socket_label() {
+  local label="${BYOBU_SESSION_TMUX_SOCKET:-}"
+  [ -n "$label" ] || return 1
+  case "$label" in
+    *[!A-Za-z0-9_.-]*|.*|*/*)
+      printf 'invalid BYOBU_SESSION_TMUX_SOCKET label: %s\n' "$label" >&2
+      return 2
+      ;;
+  esac
+  printf '%s\n' "$label"
+}
+
+tmux_socket_enabled() {
+  [ -n "${BYOBU_SESSION_TMUX_SOCKET:-}" ]
+}
+
+tmux_available() {
+  type -P tmux >/dev/null 2>&1
+}
+
+tmux() {
+  local label status
+  if label=$(tmux_socket_label); then
+    command tmux -L "$label" "$@"
+  else
+    status=$?
+    case "$status" in
+      1)
+        command tmux "$@"
+        ;;
+      *)
+        return "$status"
+        ;;
+    esac
+  fi
+}
+
+exec_tmux() {
+  local label status
+  if label=$(tmux_socket_label); then
+    exec tmux -L "$label" "$@"
+  else
+    status=$?
+    [ "$status" -eq 1 ] || return "$status"
+    exec tmux "$@"
+  fi
+}
+
+validate_tmux_socket_config() {
+  [ -z "${BYOBU_SESSION_TMUX_SOCKET:-}" ] || tmux_socket_label >/dev/null
+}
+
 truthy() {
   case "${1:-}" in
     1|true|TRUE|yes|YES|y|Y|on|ON)
@@ -64,6 +116,11 @@ real_byobu_bin() {
 }
 
 byobu_tmux_cmd() {
+  if tmux_socket_enabled; then
+    printf '%s\n' "tmux"
+    return 0
+  fi
+
   if command -v byobu-tmux >/dev/null 2>&1; then
     printf '%s\n' "byobu-tmux"
   else
@@ -83,7 +140,7 @@ tmux_has_sessions() {
 
 install_tmux_exit_autosave_hooks() {
   truthy "${BYOBU_SESSION_SKIP_EXIT_HOOKS:-0}" && return 0
-  command -v tmux >/dev/null 2>&1 || return 0
+  tmux_available || return 0
 
   local state_path hook_cmd hook_body tmux_bin
   state_path=$(state_cmd_path) || return 0
@@ -96,6 +153,9 @@ install_tmux_exit_autosave_hooks() {
   if [ -n "${BYOBU_SESSION_STATE_DIR:-}" ]; then
     cmd+=(BYOBU_SESSION_STATE_DIR="$BYOBU_SESSION_STATE_DIR")
   fi
+  if [ -n "${BYOBU_SESSION_TMUX_SOCKET:-}" ]; then
+    cmd+=(BYOBU_SESSION_TMUX_SOCKET="$BYOBU_SESSION_TMUX_SOCKET")
+  fi
   cmd+=("$state_path" hook-autosave "$snapshot_name")
 
   hook_cmd=$(shell_join "${cmd[@]}")
@@ -107,7 +167,7 @@ install_tmux_exit_autosave_hooks() {
 }
 
 best_live_session_name() {
-  command -v tmux >/dev/null 2>&1 || return 1
+  tmux_available || return 1
 
   local session windows attached activity codex
   {
@@ -138,8 +198,13 @@ attach_best_session_if_plain_launch() {
   [ -n "$session" ] || return 1
 
   tmux_bin=$(byobu_tmux_cmd)
+  if tmux_socket_enabled && [ "$tmux_bin" = "tmux" ]; then
+    exec_tmux attach-session -t "$session"
+  fi
   exec "$tmux_bin" attach-session -t "$session"
 }
+
+validate_tmux_socket_config
 
 if ! truthy "${BYOBU_SESSION_SKIP_AUTORESTORE:-0}"; then
   state_cmd autorestore --restart-codex "$snapshot_name" >/dev/null || true

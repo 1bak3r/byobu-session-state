@@ -420,6 +420,18 @@ To force a specific session name:
 ssh -t -p 2222 bak3r@desktop-gdjcaft 'BYOBU_REMOTE_SESSION=byobu ~/.local/bin/byobu-remote'
 ```
 
+If the host keeps Byobu on a named tmux socket, point the helper at that socket
+label:
+
+```bash
+ssh -t codex@srv1635328 'BYOBU_REMOTE_SOCKET=byobu-main ~/.local/bin/byobu-remote'
+```
+
+The lower-level helpers use the same setting as
+`BYOBU_SESSION_TMUX_SOCKET=byobu-main`, including `byobu-session-state`,
+`byobu-codex`, and `byobu-git-sync`. Socket labels are limited to simple
+`A-Za-z0-9_.-` names.
+
 To inspect the current state without attaching:
 
 ```bash

@@ -28,11 +28,15 @@ chmod +x "$fake_bin/byobu-session-state"
 cat > "$fake_bin/tmux" <<EOF
 #!/usr/bin/env bash
 printf 'tmux:%s\n' "\$*" >> "$log_file"
-if [ "\${1:-}" = "list-sessions" ]; then
+args=("\$@")
+if [ "\${args[0]:-}" = "-L" ]; then
+  args=("\${args[@]:2}")
+fi
+if [ "\${args[0]:-}" = "list-sessions" ]; then
   printf 'old\t4\t0\t100\n'
   printf 'attached\t1\t1\t90\n'
-elif [ "\${1:-}" = "list-windows" ]; then
-  case " \$* " in
+elif [ "\${args[0]:-}" = "list-windows" ]; then
+  case " \${args[*]} " in
     *' -t old '*)
       printf 'thread-a\nthread-b\nthread-c\nthread-d\n'
       ;;
@@ -67,6 +71,7 @@ grep -Fxq "state:autorestore --restart-codex test" "$log_file" || {
 
 grep -Fxq "byobu-tmux:attach-session -t old" "$log_file" || {
   echo "byobu-remote did not attach to the selected live session" >&2
+  cat "$log_file" >&2
   exit 1
 }
 
@@ -81,6 +86,22 @@ env PATH="$fake_bin:$PATH" BYOBU_REMOTE_SESSION=old \
 
 grep -Fxq "byobu-tmux:attach-session -t old" "$log_file" || {
   echo "byobu-remote did not honor BYOBU_REMOTE_SESSION" >&2
+  exit 1
+}
+
+: > "$log_file"
+env PATH="$fake_bin:$PATH" BYOBU_REMOTE_SOCKET=byobu-main \
+  script -qfec "$repo_root/bin/byobu-remote" /dev/null >/dev/null
+
+grep -Fxq "tmux:-L byobu-main list-sessions -F #{session_name}	#{session_windows}	#{session_attached}	#{session_activity}" "$log_file" || {
+  echo "byobu-remote did not list sessions through the named tmux socket" >&2
+  cat "$log_file" >&2
+  exit 1
+}
+
+grep -Fxq "tmux:-L byobu-main attach-session -t old" "$log_file" || {
+  echo "byobu-remote did not attach through the named tmux socket" >&2
+  cat "$log_file" >&2
   exit 1
 }
 
