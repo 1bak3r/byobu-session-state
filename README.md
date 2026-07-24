@@ -261,6 +261,11 @@ byobu-codex adopt --dry-run
 byobu-codex adopt
 ```
 
+Adoption also corrects stale inherited thread metadata when the live Codex
+process exposes a different `CODEX_THREAD_ID` or has its active rollout file
+open. A bare Codex process that has not created a thread yet is marked as a new
+session instead of retaining another tab's thread ID.
+
 List tagged tabs and recent Codex threads:
 
 ```bash

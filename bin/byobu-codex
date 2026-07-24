@@ -206,6 +206,13 @@ set_window_option() {
   tmux set-option -wq -t "$target" "$key" "$value" >/dev/null 2>&1 || true
 }
 
+unset_window_option() {
+  local target="$1"
+  local key="$2"
+  [ -n "$target" ] || return 0
+  tmux set-option -wuq -t "$target" "$key" >/dev/null 2>&1 || true
+}
+
 window_option() {
   local target="$1"
   local key="$2"
@@ -219,6 +226,7 @@ set_codex_window_options() {
   local thread_id="${4:-}"
   local started_at_ms="${5:-}"
 
+  unset_window_option "$target" "@byobu-codex-dedup-suppressed"
   set_window_option "$target" "@byobu-codex" "1"
   set_window_option "$target" "@byobu-codex-mode" "$mode"
   set_window_option "$target" "@byobu-codex-cwd" "$cwd"
@@ -226,6 +234,8 @@ set_codex_window_options() {
   [ -z "$started_at_ms" ] || set_window_option "$target" "@byobu-codex-started-at-ms" "$started_at_ms"
   if is_uuid_like "$thread_id"; then
     set_window_option "$target" "@byobu-codex-thread-id" "$thread_id"
+  else
+    unset_window_option "$target" "@byobu-codex-thread-id"
   fi
 }
 
@@ -487,7 +497,10 @@ codex_descendant_thread_id() {
   command -v python3 >/dev/null 2>&1 || return 1
 
   python3 - "$root_pid" <<'PY'
+import json
 import os
+import re
+import shlex
 import subprocess
 import sys
 from collections import defaultdict, deque
@@ -516,10 +529,51 @@ for line in output.splitlines():
     children[ppid].append(pid)
     args_by_pid[pid] = parts[2]
 
-queue = deque([root])
+uuid_pattern = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
+
+def rollout_thread_id(pid):
+    fd_dir = f"/proc/{pid}/fd"
+    try:
+        fd_names = os.listdir(fd_dir)
+    except OSError:
+        return None
+
+    for fd_name in fd_names:
+        fd_path = os.path.join(fd_dir, fd_name)
+        try:
+            target = os.readlink(fd_path)
+        except OSError:
+            continue
+        target = target.removesuffix(" (deleted)")
+        basename = os.path.basename(target)
+        if not (basename.startswith("rollout-") and basename.endswith(".jsonl")):
+            continue
+        try:
+            with open(fd_path, "r", encoding="utf-8") as fh:
+                record = json.loads(fh.readline())
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        if record.get("type") != "session_meta":
+            continue
+        payload = record.get("payload")
+        if not isinstance(payload, dict):
+            continue
+        value = payload.get("id") or payload.get("session_id")
+        if isinstance(value, str) and uuid_pattern.fullmatch(value):
+            return value
+
+    return None
+
+queue = deque([(root, 0)])
 seen = set()
+environment_matches = []
+rollout_matches = []
+resume_matches = []
 while queue:
-    pid = queue.popleft()
+    pid, depth = queue.popleft()
     if pid in seen:
         continue
     seen.add(pid)
@@ -534,10 +588,30 @@ while queue:
         for item in env:
             if item.startswith(b"CODEX_THREAD_ID="):
                 value = item.split(b"=", 1)[1].decode("utf-8", "ignore")
-                if value:
-                    print(value)
-                    sys.exit(0)
-    queue.extend(children.get(pid, []))
+                if uuid_pattern.fullmatch(value):
+                    environment_matches.append((depth, value))
+        value = rollout_thread_id(pid)
+        if value:
+            rollout_matches.append((depth, value))
+        try:
+            tokens = shlex.split(args)
+        except ValueError:
+            tokens = args.split()
+        for index, token in enumerate(tokens[:-1]):
+            value = tokens[index + 1]
+            if token == "resume" and uuid_pattern.fullmatch(value):
+                resume_matches.append((depth, value))
+    queue.extend((child, depth + 1) for child in children.get(pid, []))
+
+if rollout_matches:
+    print(max(rollout_matches)[1])
+    sys.exit(0)
+if resume_matches:
+    print(max(resume_matches)[1])
+    sys.exit(0)
+if environment_matches:
+    print(max(environment_matches)[1])
+    sys.exit(0)
 
 sys.exit(1)
 PY
@@ -917,6 +991,16 @@ cmd_adopt() {
           set_codex_window_options "$target" "resume" "$pane_path" "$env_thread_id" "$(now_ms)"
           adopted=$((adopted + 1))
           [ "$quiet" -eq 1 ] || printf 'Corrected %s %s -> %s\n' "$target" "$window_name" "$env_thread_id"
+        fi
+        continue
+      fi
+      if ! is_uuid_like "$env_thread_id"; then
+        if [ "$dry_run" -eq 1 ]; then
+          printf 'Would clear stale %s %s -> new session\n' "$target" "$window_name"
+        else
+          set_codex_window_options "$target" "new" "$pane_path" "" "$(now_ms)"
+          adopted=$((adopted + 1))
+          [ "$quiet" -eq 1 ] || printf 'Cleared stale %s %s -> new session\n' "$target" "$window_name"
         fi
         continue
       fi

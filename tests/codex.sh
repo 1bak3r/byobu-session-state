@@ -10,17 +10,28 @@ restored_session="byobu-codex-restored-$$"
 adopt_session="byobu-codex-adopt-$$"
 thread_id="019f1075-142d-7ff1-b822-a1a07395d955"
 adopt_thread_id="019f9999-0000-7000-8000-000000000001"
+rollout_thread_id="019f9999-0000-7000-8000-000000000002"
+resume_thread_id="019f9999-0000-7000-8000-000000000003"
 stale_thread_id="019f9999-0000-7000-8000-000000000099"
 fake_codex="$tmp_dir/fake-codex"
 crashy_codex="$tmp_dir/crashy-codex"
 plain_codex="$tmp_dir/codex"
+rollout_codex="$tmp_dir/codex-rollout"
+rollout_path="$tmp_dir/rollout-2026-07-23T21-26-00-$rollout_thread_id.jsonl"
 exit_codex="$tmp_dir/exit-codex"
 codex_home="$tmp_dir/codex-home"
 codex_log="$tmp_dir/codex.log"
 crashy_log="$tmp_dir/crashy.log"
 crashy_count="$tmp_dir/crashy-count"
 
-unset TMUX TMUX_PANE
+unset TMUX TMUX_PANE CODEX_THREAD_ID
+for inherited_fd_path in /proc/$$/fd/*; do
+  inherited_fd=${inherited_fd_path##*/}
+  case "$inherited_fd" in
+    0|1|2|255) continue ;;
+  esac
+  eval "exec ${inherited_fd}>&-"
+done
 
 cleanup() {
   tmux kill-session -t "$session_name" >/dev/null 2>&1 || true
@@ -61,6 +72,24 @@ cat > "$plain_codex" <<'EOF'
 sleep 900
 EOF
 chmod +x "$plain_codex"
+
+cat > "$rollout_codex" <<'EOF'
+#!/usr/bin/env bash
+for fd_path in /proc/$$/fd/*; do
+  fd=${fd_path##*/}
+  case "$fd" in
+    0|1|2|255) continue ;;
+  esac
+  eval "exec ${fd}>&-"
+done
+exec 33<"$BYOBU_CODEX_ROLLOUT"
+sleep 900 &
+wait
+EOF
+chmod +x "$rollout_codex"
+printf '%s\n' \
+  "{\"type\":\"session_meta\",\"payload\":{\"id\":\"$rollout_thread_id\",\"session_id\":\"$rollout_thread_id\"}}" \
+  >"$rollout_path"
 
 cat > "$exit_codex" <<'EOF'
 #!/usr/bin/env bash
@@ -233,6 +262,16 @@ PY
 
 tmux new-session -d -s "$adopt_session" -n node -c "$tmp_dir" "CODEX_THREAD_ID=$adopt_thread_id $plain_codex"
 tmux set-option -wq -t "$adopt_session:0" '@byobu-codex-thread-id' "$stale_thread_id"
+tmux new-window -d -t "$adopt_session:" -n rollout -c "$tmp_dir" \
+  "CODEX_THREAD_ID=$stale_thread_id BYOBU_CODEX_ROLLOUT=$rollout_path $rollout_codex"
+tmux set-option -wq -t "$adopt_session:1" '@byobu-codex-thread-id' "$stale_thread_id"
+tmux set-option -wq -t "$adopt_session:1" '@byobu-codex-dedup-suppressed' "stale-test-value"
+tmux new-window -d -t "$adopt_session:" -n bare -c "$tmp_dir" "$plain_codex"
+tmux set-option -wq -t "$adopt_session:2" '@byobu-codex-thread-id' "$stale_thread_id"
+tmux set-option -wq -t "$adopt_session:2" '@byobu-codex-dedup-suppressed' "stale-test-value"
+tmux new-window -d -t "$adopt_session:" -n explicit-resume -c "$tmp_dir" \
+  "$plain_codex resume $resume_thread_id"
+tmux set-option -wq -t "$adopt_session:3" '@byobu-codex-thread-id' "$stale_thread_id"
 sleep 0.5
 env \
   PATH="$repo_root/bin:$PATH" \
@@ -242,6 +281,32 @@ env \
 
 [ "$(tmux show-options -wqv -t "$adopt_session:0" '@byobu-codex-thread-id')" = "$adopt_thread_id" ] || {
   echo "adopt did not tag a generic running Codex pane from recent thread state" >&2
+  exit 1
+}
+
+actual_rollout_thread_id=$(tmux show-options -wqv -t "$adopt_session:1" '@byobu-codex-thread-id')
+[ "$actual_rollout_thread_id" = "$rollout_thread_id" ] || {
+  echo "adopt did not correct stale metadata from the live Codex rollout file: got $actual_rollout_thread_id" >&2
+  exit 1
+}
+[ -z "$(tmux show-options -wqv -t "$adopt_session:1" '@byobu-codex-dedup-suppressed')" ] || {
+  echo "adopt did not clear stale duplicate-suppression metadata" >&2
+  exit 1
+}
+[ -z "$(tmux show-options -wqv -t "$adopt_session:2" '@byobu-codex-thread-id')" ] || {
+  echo "adopt did not clear inherited thread metadata from a bare new Codex process" >&2
+  exit 1
+}
+[ "$(tmux show-options -wqv -t "$adopt_session:2" '@byobu-codex-mode')" = "new" ] || {
+  echo "adopt did not mark the bare Codex process as a new session" >&2
+  exit 1
+}
+[ -z "$(tmux show-options -wqv -t "$adopt_session:2" '@byobu-codex-dedup-suppressed')" ] || {
+  echo "adopt did not clear duplicate suppression from the bare Codex process" >&2
+  exit 1
+}
+[ "$(tmux show-options -wqv -t "$adopt_session:3" '@byobu-codex-thread-id')" = "$resume_thread_id" ] || {
+  echo "adopt did not preserve an explicit Codex resume thread" >&2
   exit 1
 }
 
