@@ -1,3 +1,5 @@
+> **Archived 2026-11-10.** This copy is no longer maintained and is kept for reference only.
+
 # byobu-session-state
 
 Small deterministic snapshot/restore helper for Byobu sessions using the tmux
